@@ -1,109 +1,108 @@
-# Copyright 2013 <Your Name Here>
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at:
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-A skeleton POX component
-
-You can customize this to do whatever you like.  Don't forget to
-adjust the Copyright above, and to delete the Apache license if you
-don't want to release under Apache (but consider doing so!).
-
-Rename this file to whatever you like, .e.g., mycomponent.py.  You can
-then invoke it with "./pox.py mycomponent" if you leave it in the
-ext/ directory.
-
-Implement a launch() function (as shown below) which accepts commandline
-arguments and starts off your component (e.g., by listening to events).
-
-Edit this docstring and your launch function's docstring.  These will
-show up when used with the help component ("./pox.py help --mycomponent").
-"""
-
 # Import some POX stuff
-from pox.core import core                     # Main POX object
-import pox.openflow.libopenflow_01 as of      # OpenFlow 1.0 library
-import pox.lib.packet as pkt                  # Packet parsing/construction
-from pox.lib.addresses import EthAddr, IPAddr # Address types
-import pox.lib.util as poxutil                # Various util functions
-import pox.lib.revent as revent               # Event library
-import pox.lib.recoco as recoco               # Multitasking library
+from pox.core import core                       # Main POX object
+import pox.openflow.libopenflow_01 as of        # OpenFlow 1.0 library
+from pox.lib.addresses import EthAddr, IPAddr   # Address types
+from pox.lib.packet.ethernet import ethernet
 
-# Create a logger for this component
 log = core.getLogger()
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+RESET = "\033[0m"
 
 
-def _go_up (event):
-  # Event handler called when POX goes into up state
-  # (we actually listen to the event in launch() below)
-  log.info("Skeleton application ready (to do nothing).")
+def log_color(color, msg):
+    log.info(f"{color}{msg}{RESET}")
 
 
-@poxutil.eval_args
-def launch (foo, bar = False):
-  """
-  The default launcher just logs its arguments
-  """
-  # When your component is specified on the commandline, POX automatically
-  # calls this function.
+PRIVATE_SUBNET = IPAddr("192.168.1.0")      # Red interna
+PRIVATE_MASK = 24                           # Máscara de la red interna
+PRIVATE_IP = IPAddr("192.168.1.254")        # IP del router en la red privada
+PUBLIC_IP = IPAddr("200.0.0.254")           # IP del router en la red pública
+PUBLIC_MAC = EthAddr("00:00:00:aa:aa:aa")   # MAC del router hacia la red pública
+PRIVATE_MAC = EthAddr("00:00:00:bb:bb:bb")  # MAC del router hacia la red privada
+PUBLIC_PORT = 1                             # Puerto del switch conectado a la red pública
 
-  # Add whatever parameters you want to this.  They will become
-  # commandline arguments.  You can specify default values or not.
-  # In this example, foo is required and bar is not.  You may also
-  # specify a keyword arguments catch-all (e.g., **kwargs).
-
-  # For example, you can execute this component as:
-  # ./pox.py skeleton --foo=3 --bar=4
-
-  # Note that arguments passed from the commandline are ordinarily
-  # always strings, and it's up to you to validate and convert them.
-  # The one exception is if a user specifies the parameter name but no
-  # value (e.g., just "--foo").  In this case, it receives the actual
-  # Python value True.
-  # The @pox.util.eval_args decorator interprets them as if they are
-  # Python literals.  Even things like --foo=[1,2,3] behave as expected.
-  # Things that don't appear to be Python literals are left as strings.
-
-  # If you want to be able to invoke the component multiple times, add
-  # __INSTANCE__=None as the last parameter.  When multiply-invoked, it
-  # will be passed a tuple with the following:
-  # 1. The number of this instance (0...n-1)
-  # 2. The total number of instances for this module
-  # 3. True if this is the last instance, False otherwise
-  # The last is just a comparison between #1 and #2, but is convenient.
-
-  log.warn("Foo: %s (%s)", foo, type(foo))
-  log.warn("Bar: %s (%s)", bar, type(bar))
-
-  core.addListenerByName("UpEvent", _go_up)
+H1_MAC = EthAddr("00:00:00:00:00:01")       # MAC del host externo (TODO: resolver mediante ARP)
 
 
-def breakfast ():
-  """
-  Serves a Pythonic breakfast
-  """
-  # You can invoke other functions from the commandline too.  We call
-  # these multiple or alternative launch functions.  To execute this
-  # one, you'd do:
-  # ./pox.py skeleton:breakfast
+class ProtoRouter(object):
+    def __init__(self, connection):
+        self.connection = connection
+        connection.addListeners(self)
 
-  import random
-  items = "egg,bacon,sausage,baked beans,tomato".split(',')
-  random.shuffle(items)
-  breakfast = items[:random.randint(0,len(items))]
-  breakfast += ['spam'] * random.randint(0,len(breakfast)+1)
-  random.shuffle(breakfast)
-  if len(breakfast) == 0: breakfast = ["lobster thermidor aux crevettes"]
+    def _handle_PacketIn(self, event):
+        if not event.parsed.parsed:
+            log.warning("[DROP] PacketIn con trama no reconocida. POX no pudo decodificar el paquete.")
+            return
 
-  log.warn("Breakfast is served:")
-  log.warn("%s and spam", ", ".join(breakfast))
+        if event.parsed.type == ethernet.IP_TYPE:
+            self.handle_ip(event)
+        else:
+            log_color(YELLOW, f"Paquete ignorado: protocolo distinto de IPv4.")
+
+    def handle_ip(self, event):
+        packet = event.parsed
+        ip_pkt = packet.payload
+        in_port = event.port
+
+        log_color(
+            YELLOW, f"RECIBIDO: {ip_pkt.srcip} → {ip_pkt.dstip} | "
+            f"MAC: {packet.src} → {packet.dst} | In Port: {in_port}")
+
+        if ip_pkt.srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
+
+            log_color(GREEN, f"MATCH: {ip_pkt.srcip} pertenece a la red privada {PRIVATE_SUBNET}/{PRIVATE_MASK}")
+
+            # Instalar Flujo Saliente
+            fm = of.ofp_flow_mod()
+            fm.idle_timeout = 10
+
+            # Filtro (Saliente)
+            fm.match.nw_src = ip_pkt.srcip
+            fm.match.dl_type = 0x800  # IPv4
+            fm.match.in_port = in_port
+
+            # Acción (Saliente)
+            fm.actions.append(of.ofp_action_dl_addr.set_src(PUBLIC_MAC))
+            fm.actions.append(of.ofp_action_dl_addr.set_dst(H1_MAC))
+            fm.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
+            self.connection.send(fm)
+
+            # Instalar Flujo Entrante (para respuesta)
+            fm_back = of.ofp_flow_mod()
+            fm_back.idle_timeout = 10
+
+            # Filtro (Entrante)
+            fm_back.match.nw_src = ip_pkt.dstip
+            fm_back.match.nw_dst = ip_pkt.srcip
+            fm_back.match.dl_type = 0x800  # IPv4
+            fm_back.match.in_port = PUBLIC_PORT
+
+            # Acción (Entrante)
+            fm_back.actions.append(of.ofp_action_dl_addr.set_src(PRIVATE_MAC))
+            fm_back.actions.append(of.ofp_action_dl_addr.set_dst(packet.src))
+            fm_back.actions.append(of.ofp_action_output(port=in_port))
+            self.connection.send(fm_back)
+
+            # Reenviar paquete actual con MACs actualizadas (Los posteriores pasan por flujo)
+            packet.src = PUBLIC_MAC
+            packet.dst = H1_MAC
+            msg = of.ofp_packet_out()
+            msg.data = packet.pack()
+            msg.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
+            log_color(CYAN, f"ENVIANDO: {ip_pkt.srcip} → {ip_pkt.dstip} | MAC: {PUBLIC_MAC} → {H1_MAC} | Out Port: {PUBLIC_PORT}")
+            self.connection.send(msg)
+
+        else:
+            log_color(RED, f"NO MATCH: {ip_pkt.srcip} no pertenece a {PRIVATE_SUBNET}/{PRIVATE_MASK}")
+
+
+def launch():
+
+    def start_switch(event):
+        log_color(YELLOW, f"Iniciando ProtoRouter para Switch {event.connection.dpid}")
+        ProtoRouter(event.connection)
+
+    core.openflow.addListenerByName("ConnectionUp", start_switch)
