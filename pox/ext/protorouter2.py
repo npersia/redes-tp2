@@ -3,6 +3,8 @@ import pox.openflow.libopenflow_01 as of
 from pox.lib.addresses import EthAddr, IPAddr
 from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.arp import arp
+from pox.lib.packet.ipv4 import ipv4
+from pox.lib.packet.icmp import icmp
 from collections import defaultdict
 
 log = core.getLogger()
@@ -32,10 +34,11 @@ FLOW_IDLE_TIMEOUT = 30  # Timeout de inactividad para liberar flujos en segundos
 
 
 class ARPManager(object):
-    """Mantiene la tabla ARP dinámica, responde consultas al router y encola paquetes."""
+    """Mantiene la tabla ARP dinámica, mapeo de puertos LAN, responde consultas al router y encola paquetes."""
 
     def __init__(self):
         self.arp_table = {}  # IPAddr -> EthAddr
+        self.ip_to_port = {}  # IPAddr -> port (int)
         self.pending_packets = defaultdict(list)  # IPAddr -> list(events)
 
     def handle_arp(self, connection, event):
@@ -46,10 +49,11 @@ class ARPManager(object):
         if not arp_pkt:
             return None
 
-        # Aprender dirección MAC del emisor
+        # Aprender dirección MAC y Puerto físico del emisor
         self.arp_table[arp_pkt.protosrc] = arp_pkt.hwsrc
+        self.ip_to_port[arp_pkt.protosrc] = in_port
 
-        # 1. ARP Request: Responder si consultan por las IPs del Router
+        # 1. ARP Request
         if arp_pkt.opcode == arp.REQUEST:
             if arp_pkt.protodst == PRIVATE_IP:
                 log_color(CYAN, f"[ARP] Respondiendo a {arp_pkt.protosrc} por IP Privada {PRIVATE_IP}")
@@ -57,10 +61,27 @@ class ARPManager(object):
             elif arp_pkt.protodst == PUBLIC_IP:
                 log_color(CYAN, f"[ARP] Respondiendo a {arp_pkt.protosrc} por IP Pública {PUBLIC_IP}")
                 self._send_arp_reply(connection, in_port, PUBLIC_MAC, PUBLIC_IP, arp_pkt.hwsrc, arp_pkt.protosrc)
+            elif arp_pkt.protodst.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
+                # Consulta entre hosts locales (ej: h3 buscando a h2) -> Inundar a la LAN
+                msg = of.ofp_packet_out()
+                msg.data = event.ofp
+                msg.in_port = in_port
+                msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+                connection.send(msg)
 
-        # 2. ARP Reply: Liberar paquetes encolados
+        # 2. ARP Reply
         elif arp_pkt.opcode == arp.REPLY:
-            log_color(GREEN, f"[ARP] Aprendida MAC de {arp_pkt.protosrc} -> {arp_pkt.hwsrc}")
+            log_color(GREEN, f"[ARP] Aprendida MAC de {arp_pkt.protosrc} -> {arp_pkt.hwsrc} (Puerto {in_port})")
+
+            # Reenviar respuesta ARP local si no era para las IPs del router
+            if arp_pkt.protodst != PRIVATE_IP and arp_pkt.protodst != PUBLIC_IP:
+                dst_port = self.ip_to_port.get(arp_pkt.protodst, of.OFPP_FLOOD)
+                msg = of.ofp_packet_out()
+                msg.data = event.ofp
+                msg.in_port = in_port
+                msg.actions.append(of.ofp_action_output(port=dst_port))
+                connection.send(msg)
+
             if arp_pkt.protosrc in self.pending_packets:
                 return self.pending_packets.pop(arp_pkt.protosrc)
 
@@ -170,7 +191,64 @@ class ProtoRouter(object):
         src_ip = ip_pkt.srcip
         dst_ip = ip_pkt.dstip
 
-        # Tráfico Saliente (Red Privada -> Red Pública)
+        # Registrar puerto físico del emisor
+        self.arp_mgr.ip_to_port[src_ip] = in_port
+
+        # 0. Tráfico ICMP dirigido a las propias IPs del Router (Ping al Gateway)
+        if dst_ip == PRIVATE_IP or dst_ip == PUBLIC_IP:
+            icmp_pkt = packet.find('icmp')
+            if icmp_pkt and icmp_pkt.type == 8:  # 8 = ICMP Echo Request
+                log_color(CYAN, f"[ICMP Router] Respondiendo Ping a IP local {dst_ip} desde {src_ip}")
+
+                reply_icmp = icmp()
+                reply_icmp.type = 0  # 0 = ICMP Echo Reply
+                reply_icmp.payload = icmp_pkt.payload
+
+                reply_ip = ipv4()
+                reply_ip.protocol = ipv4.ICMP_PROTOCOL
+                reply_ip.srcip = dst_ip
+                reply_ip.dstip = src_ip
+                reply_ip.payload = reply_icmp
+
+                router_mac = PRIVATE_MAC if dst_ip == PRIVATE_IP else PUBLIC_MAC
+                reply_eth = ethernet()
+                reply_eth.type = ethernet.IP_TYPE
+                reply_eth.src = router_mac
+                reply_eth.dst = packet.src
+                reply_eth.payload = reply_ip
+
+                msg = of.ofp_packet_out()
+                msg.data = reply_eth.pack()
+                msg.in_port = in_port
+                msg.actions.append(of.ofp_action_output(port=in_port))
+                self.connection.send(msg)
+            return
+
+        # 0.5. Tráfico LAN Local sin NAT (Privado -> Privado, ej: h3 -> h2)
+        if src_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK) and dst_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
+            dst_port = self.arp_mgr.ip_to_port.get(dst_ip)
+            msg = of.ofp_packet_out()
+            msg.data = event.ofp
+            msg.in_port = in_port
+
+            if dst_port:
+                msg.actions.append(of.ofp_action_output(port=dst_port))
+                # Instalar flujo directo L2/L3 en el switch para conmutación local rápida
+                fm = of.ofp_flow_mod()
+                fm.idle_timeout = FLOW_IDLE_TIMEOUT
+                fm.match.in_port = in_port
+                fm.match.dl_type = 0x0800
+                fm.match.nw_src = src_ip
+                fm.match.nw_dst = dst_ip
+                fm.actions.append(of.ofp_action_output(port=dst_port))
+                self.connection.send(fm)
+            else:
+                msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+
+            self.connection.send(msg)
+            return
+
+        # 1. Tráfico Saliente (Red Privada -> Red Pública con NAT/PAT)
         if src_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
             # Obtener/Resolver MAC de Destino
             dst_mac = self.arp_mgr.arp_table.get(dst_ip)
@@ -230,10 +308,11 @@ class ProtoRouter(object):
                 # Reenviar primer paquete (PacketOut)
                 msg = of.ofp_packet_out()
                 msg.data = event.ofp
+                msg.in_port = in_port
                 msg.actions = fm_out.actions
                 self.connection.send(msg)
 
-            # Caso ICMP / Ping
+            # Caso ICMP / Ping atravesando NAT
             elif packet.find('icmp'):
                 fm_out = of.ofp_flow_mod()
                 fm_out.idle_timeout = FLOW_IDLE_TIMEOUT
@@ -265,11 +344,12 @@ class ProtoRouter(object):
 
                 msg = of.ofp_packet_out()
                 msg.data = event.ofp
+                msg.in_port = in_port
                 msg.actions = fm_out.actions
                 self.connection.send(msg)
 
     def _handle_FlowRemoved(self, event):
-        """Libera los puertos PAT cuando expiración de reglas."""
+        """Libera los puertos PAT cuando expiran las reglas."""
         ofp = event.ofp
         if ofp.match.dl_type == 0x0800 and ofp.match.nw_dst == PUBLIC_IP:
             nat_port = ofp.match.tp_dst
