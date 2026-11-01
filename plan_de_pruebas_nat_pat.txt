@@ -1,0 +1,160 @@
+================================================================================
+          BATERÍA DE PRUEBAS DE VALIDACIÓN - PROTOROUTER NAT/PAT
+================================================================================
+
+Este documento detalla el plan de pruebas para verificar el correcto 
+funcionamiento del controlador POX (protorouter.py) sobre la topología 
+Mininet (topo_1e_3i_1s.py).
+
+--------------------------------------------------------------------------------
+1. RESOLUCIÓN ARP DINÁMICA Y TABLA L2
+--------------------------------------------------------------------------------
+
+Prueba 1.1: Verificación de Tablas ARP en Frío
+----------------------------------------------
+* Objetivo: Confirmar que la red no depende de entradas ARP estáticas ni 
+  mapeos preconfigurados.
+* Comandos (CLI Mininet):
+    mininet> h1 arp -n
+    mininet> h2 arp -n
+* Comportamiento Esperado: Las tablas ARP de los hosts deben mostrarse vacías 
+  o con entradas incompletas antes de iniciar tráfico.
+
+Prueba 1.2: Resolución ARP hacia las Interfaces del Router
+----------------------------------------------------------
+* Objetivo: Validar que ARPManager responde solicitudes ARP dirigidas a la IP 
+  privada (192.168.1.254) y a la IP pública (200.0.0.254).
+* Comandos (CLI Mininet):
+    mininet> h2 ping -c 1 192.168.1.254
+    mininet> h1 ping -c 1 200.0.0.254
+* Comportamiento Esperado: 0% packet loss. h2 aprende la MAC 00:00:00:bb:bb:bb 
+  y h1 aprende la MAC 00:00:00:aa:aa:aa.
+
+
+--------------------------------------------------------------------------------
+2. CONECTIVIDAD ICMP Y AISLAMIENTO NAT
+--------------------------------------------------------------------------------
+
+Prueba 2.1: Ping Saliente (Red Privada -> Red Pública)
+------------------------------------------------------
+* Objetivo: Verificar el enrutamiento ICMP con reescritura de direcciones 
+  IP/MAC y la resolución ARP dinámica del host público.
+* Comandos (CLI Mininet):
+    mininet> h2 ping -c 3 200.0.0.1
+* Comportamiento Esperado: El router genera un ARP Request para descubrir a h1 
+  y posteriormente encamina el tráfico ICMP de forma bidireccional.
+
+Prueba 2.2: Ping Simultáneo desde Múltiples Hosts Privados
+----------------------------------------------------------
+* Objetivo: Evaluar el procesamiento concurrente de solicitudes ICMP desde 
+  distintos clientes privados.
+* Comandos (CLI Mininet):
+    mininet> h2 ping -c 3 200.0.0.1 & h3 ping -c 3 200.0.0.1 & h4 ping -c 3 200.0.0.1
+* Comportamiento Esperado: Respuesta exitosa sin pérdida de paquetes en ninguno 
+  de los clientes privados.
+
+Prueba 2.3: Bloqueo de Tráfico Inbound No Solicitado (Red Pública -> Red Privada)
+---------------------------------------------------------------------------------
+* Objetivo: Garantizar que el router actúe como firewall de estado bloqueando 
+  tráfico iniciado desde la red pública.
+* Comandos (CLI Mininet):
+    mininet> h1 ping -c 2 192.168.1.2
+* Comportamiento Esperado: 100% packet loss (Destination Host Unreachable), ya 
+  que no existe ningún mapeo previo en la tabla PAT.
+
+Prueba 2.4: Destino Inexistente y Manejo de Errores ARP
+------------------------------------------------------
+* Objetivo: Verificar la resiliencia del controlador ante paquetes dirigidos a 
+  direcciones IP no alcanzables.
+* Comandos (CLI Mininet):
+    mininet> h2 ping -c 2 200.0.0.99
+* Comportamiento Esperado: El router envía solicitudes ARP buscando 200.0.0.99 
+  y descarta los paquetes encolados sin provocar excepciones ni colapsar POX.
+
+
+--------------------------------------------------------------------------------
+3. CONCURRENCIA Y TRADUCCIÓN PAT EN CAPA 4 (TCP / UDP)
+--------------------------------------------------------------------------------
+
+Prueba 3.1: Múltiples Clientes TCP en Simultáneo
+------------------------------------------------
+* Objetivo: Probar la multiplexación 1:N con asignación dinámica de puertos 
+  efímeros (PATManager).
+* Comandos (CLI Mininet):
+    mininet> sh killall iperf
+    mininet> h1 iperf -s &
+    mininet> h2 iperf -c 200.0.0.1 -t 5 &
+    mininet> h3 iperf -c 200.0.0.1 -t 5 &
+    mininet> h4 iperf -c 200.0.0.1 -t 5
+* Comportamiento Esperado: Las tres pruebas completan la transferencia de datos 
+  de forma paralela sin colisiones de puertos.
+
+Prueba 3.2: Múltiples Conexiones Salientes desde un Mismo Host
+--------------------------------------------------------------
+* Objetivo: Validar que un mismo host cliente pueda mantener múltiples flujos 
+  TCP independientes hacia el mismo servidor público.
+* Comandos (CLI Mininet):
+    mininet> h2 iperf -c 200.0.0.1 -p 5001 -t 5 &
+    mininet> h2 iperf -c 200.0.0.1 -p 5001 -t 5
+* Comportamiento Esperado: Se asignan dos puertos públicos efímeros distintos 
+  para diferenciar ambas conexiones del mismo host.
+
+Prueba 3.3: Tráfico UDP y Reescritura L4
+----------------------------------------
+* Objetivo: Verificar la traducción PAT sobre protocolos no orientados a conexión.
+* Comandos (CLI Mininet):
+    mininet> sh killall iperf
+    mininet> h1 iperf -s -u &
+    mininet> h2 iperf -c 200.0.0.1 -u -b 10M -t 5
+* Comportamiento Esperado: Transferencia UDP exitosa con reescritura de puertos 
+  UDP en los flujos instalados.
+
+
+--------------------------------------------------------------------------------
+4. INSPECCIÓN DE FLUJOS OPENFLOW Y RECICLAJE DE PUERTOS
+--------------------------------------------------------------------------------
+
+Prueba 4.1: Volcado de la Tabla de Flujos Activa (ovs-ofctl)
+-------------------------------------------------------------
+* Objetivo: Confirmar la instalación de reglas con acciones de reescritura L2, 
+  L3 y L4 en Open vSwitch.
+* Procedimiento:
+    1. En la CLI de Mininet, iniciar una prueba extendida:
+       mininet> h2 iperf -c 200.0.0.1 -t 30 &
+    2. En una terminal de Linux independiente, ejecutar:
+       sudo ovs-ofctl dump-flows s1
+* Comportamiento Esperado: Presencia de reglas de flujo bidireccionales con las 
+  acciones mod_dl_src, mod_dl_dst, mod_nw_src, mod_nw_dst, mod_tp_src y mod_tp_dst.
+
+Prueba 4.2: Expiración por Inactividad (idle_timeout) y Liberación del Pool PAT
+--------------------------------------------------------------------------------
+* Objetivo: Verificar la desinstalación automática de flujos inactivos y la 
+  devolución de puertos al pool de PATManager.
+* Procedimiento:
+    1. Generar tráfico corto:
+       mininet> h2 ping -c 1 200.0.0.1
+    2. Verificar la regla instalada:
+       sudo ovs-ofctl dump-flows s1
+    3. Esperar 35 segundos (superando el idle_timeout de 30s) sin enviar tráfico.
+    4. Volver a consultar la tabla de flujos:
+       sudo ovs-ofctl dump-flows s1
+* Comportamiento Esperado: Las reglas expiran en el switch, POX recibe el evento 
+  FlowRemoved y libera el puerto asignado para su reutilización.
+
+
+--------------------------------------------------------------------------------
+5. CAPTURA Y VERIFICACIÓN DE CABECERAS L2/L3/L4 (tcpdump)
+--------------------------------------------------------------------------------
+
+Prueba 5.1: Inspección de Reescritura de Encabezados
+-----------------------------------------------------
+* Objetivo: Comprobar mediante captura de paquetes en la interfaz pública la 
+  correcta traducción de direcciones IP y MAC de origen.
+* Procedimiento:
+    1. En una terminal de Linux independiente, iniciar tcpdump en s1-eth1:
+       sudo tcpdump -i s1-eth1 -n -v icmp or tcp
+    2. En Mininet, enviar paquetes:
+       mininet> h2 ping -c 2 200.0.0.1
+* Comportamiento Esperado: Los paquetes capturados en s1-eth1 muestran IP 
+  origen 200.0.0.254 (IP pública del router) y MAC origen 00:00:00:aa:aa:aa, 
+  confirmando el enmascaramiento completo del cliente 192.168.1.2.
