@@ -7,7 +7,7 @@ El controlador y la topología base vienen del repo de la cátedra: https://gith
 | Ruta | Contenido |
 |------|-----------|
 | `pox/` | Controlador POX (repo oficial) |
-| `pox/ext/protorouter.py` | Nuestro controlador (parte del de la cátedra) |
+| `pox/ext/protorouter_template.py` | Nuestro controlador (parte del de la cátedra) |
 | `topology/topo.py` | Topología de Mininet: h1 (pública) — s1 (NAT) — h2 (privada) |
 
 ## Topología
