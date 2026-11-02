@@ -79,16 +79,21 @@ class ARPManager(EventMixin):
         self.arp_table = {}  # IPAddr -> ARPEntry
         self.pending_packets = defaultdict(list)  # IPAddr -> list(events)
         self._cleaner = Timer(ARP_CLEAN_INTERVAL, self._expire_entries, recurring=True)
+        log_color(CYAN, f"[ARP] Tabla ARP iniciada (timeout={ARP_TIMEOUT}s, limpieza cada {ARP_CLEAN_INTERVAL}s)")
 
     def _expire_entries(self):
+        if self.arp_table:
+            log.debug(f"[ARP CLEAN] Revisando {len(self.arp_table)} entrada(s) ARP")
         for ip, entry in list(self.arp_table.items()):
             if entry.expired:
                 del self.arp_table[ip]
-                self.pending_packets.pop(ip, None)
+                pending = self.pending_packets.pop(ip, [])
+                log_color(YELLOW, f"[ARP CLEAN] Entrada vencida: {ip} -> {entry.mac} (Puerto {entry.port}), {len(pending)} paquete(s) pendiente(s) descartado(s)")
                 self.raiseEvent(ARPRemoved, ip, entry.mac, entry.port)
 
     def shutdown(self):
         if self._cleaner:
+            log_color(YELLOW, "[ARP] Deteniendo limpieza periódica de la tabla ARP")
             self._cleaner.cancel()
             self._cleaner = None
 
@@ -98,17 +103,21 @@ class ARPManager(EventMixin):
         in_port = event.port
 
         if not arp_pkt:
+            log.warning(f"[ARP] Paquete ARP inválido o no parseable en puerto {in_port}")
             return None
 
         # Aprender dirección MAC y Puerto físico del emisor
         entry = self.arp_table.get(arp_pkt.protosrc)
         if entry is None:
             self.arp_table[arp_pkt.protosrc] = ARPEntry(arp_pkt.hwsrc, in_port)
+            log_color(GREEN, f"[ARP] Nueva entrada: {arp_pkt.protosrc} -> {arp_pkt.hwsrc} (Puerto {in_port})")
         else:
             entry.refresh(arp_pkt.hwsrc, in_port)
+            log_color(GREEN, f"[ARP] Entrada actualizada: {arp_pkt.protosrc} -> {arp_pkt.hwsrc} (Puerto {in_port})")
 
         # 1. ARP Request
         if arp_pkt.opcode == arp.REQUEST:
+            log_color(YELLOW, f"[ARP] Request de {arp_pkt.protosrc} ({arp_pkt.hwsrc}) preguntando por {arp_pkt.protodst}")
             if arp_pkt.protodst == PRIVATE_IP:
                 log_color(CYAN, f"[ARP] Respondiendo a {arp_pkt.protosrc} por IP Privada {PRIVATE_IP}")
                 self._send_arp_reply(connection, in_port, PRIVATE_MAC, PRIVATE_IP, arp_pkt.hwsrc, arp_pkt.protosrc)
@@ -117,20 +126,25 @@ class ARPManager(EventMixin):
                 self._send_arp_reply(connection, in_port, PUBLIC_MAC, PUBLIC_IP, arp_pkt.hwsrc, arp_pkt.protosrc)
             elif arp_pkt.protodst.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
                 # Consulta entre hosts locales (ej: h3 buscando a h2) -> Inundar a la LAN
+                log_color(CYAN, f"[ARP] Request local por {arp_pkt.protodst}; inundando la LAN")
                 msg = of.ofp_packet_out()
                 msg.data = event.ofp
                 msg.in_port = in_port
                 msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
                 connection.send(msg)
+            else:
+                log_color(YELLOW, f"[ARP] Request no gestionado para {arp_pkt.protodst}; ignorado")
 
         # 2. ARP Reply
         elif arp_pkt.opcode == arp.REPLY:
-            log_color(GREEN, f"[ARP] Aprendida MAC de {arp_pkt.protosrc} -> {arp_pkt.hwsrc} (Puerto {in_port})")
+            log_color(CYAN, f"[ARP] Reply de {arp_pkt.protosrc} ({arp_pkt.hwsrc}) para {arp_pkt.protodst}")
 
             # Reenviar respuesta ARP local si no era para las IPs del router
             if arp_pkt.protodst != PRIVATE_IP and arp_pkt.protodst != PUBLIC_IP:
                 reply_entry = self.arp_table.get(arp_pkt.protodst)
                 dst_port = reply_entry.port if reply_entry else of.OFPP_FLOOD
+                dst_desc = "FLOOD" if dst_port == of.OFPP_FLOOD else f"puerto {dst_port}"
+                log_color(CYAN, f"[ARP] Reenviando Reply a {arp_pkt.protodst} por {dst_desc}")
                 msg = of.ofp_packet_out()
                 msg.data = event.ofp
                 msg.in_port = in_port
@@ -138,13 +152,17 @@ class ARPManager(EventMixin):
                 connection.send(msg)
 
             if arp_pkt.protosrc in self.pending_packets:
-                return self.pending_packets.pop(arp_pkt.protosrc)
+                pending = self.pending_packets.pop(arp_pkt.protosrc)
+                log_color(CYAN, f"[ARP] Desencolando {len(pending)} paquete(s) pendiente(s) para {arp_pkt.protosrc}")
+                return pending
+        else:
+            log_color(YELLOW, f"[ARP] Opcode no soportado {arp_pkt.opcode}; ignorado")
 
         return None
 
     def request_mac(self, connection, out_port, src_mac, src_ip, dst_ip):
         """Envía un ARP Request para descubrir una MAC desconocida."""
-        log_color(YELLOW, f"[ARP] Consultando MAC para IP {dst_ip}...")
+        log_color(YELLOW, f"[ARP] Consultando MAC para IP {dst_ip} (src={src_ip}/{src_mac}, salida por puerto {out_port})")
         r = arp()
         r.opcode = arp.REQUEST
         r.hwsrc = src_mac
@@ -159,6 +177,7 @@ class ARPManager(EventMixin):
         msg.data = e.pack()
         msg.actions.append(of.ofp_action_output(port=out_port))
         connection.send(msg)
+        log_color(YELLOW, f"[ARP] Request enviado por {dst_ip} a través del puerto {out_port}")
 
     def _send_arp_reply(self, connection, port, src_mac, src_ip, dst_mac, dst_ip):
         r = arp()
@@ -175,6 +194,7 @@ class ARPManager(EventMixin):
         msg.data = e.pack()
         msg.actions.append(of.ofp_action_output(port=port))
         connection.send(msg)
+        log_color(CYAN, f"[ARP] Reply enviado: {src_ip} ({src_mac}) -> {dst_ip} ({dst_mac}) por puerto {port}")
 
 
 class PATManager(object):
@@ -184,11 +204,14 @@ class PATManager(object):
         self.free_ports = set(range(start_port, end_port + 1))
         self.outbound_map = {}  # (src_ip, src_port, proto) -> nat_port
         self.inbound_map = {}  # (nat_port, proto) -> (src_ip, src_port)
+        log_color(CYAN, f"[PAT] Pool inicializado: {start_port}-{end_port} ({len(self.free_ports)} puertos libres)")
 
     def get_or_assign(self, src_ip, src_port, proto):
         key = (src_ip, src_port, proto)
         if key in self.outbound_map:
-            return self.outbound_map[key]
+            nat_port = self.outbound_map[key]
+            log_color(CYAN, f"[PAT HIT] {src_ip}:{src_port} (Proto: {proto}) ya mapeado a {PUBLIC_IP}:{nat_port}")
+            return nat_port
 
         if not self.free_ports:
             log_color(RED, "[PAT ERROR] Puertos agotados")
@@ -197,7 +220,7 @@ class PATManager(object):
         nat_port = self.free_ports.pop()
         self.outbound_map[key] = nat_port
         self.inbound_map[(nat_port, proto)] = (src_ip, src_port)
-        log_color(GREEN, f"[PAT MAP] {src_ip}:{src_port} <-> {PUBLIC_IP}:{nat_port} (Proto: {proto})")
+        log_color(GREEN, f"[PAT MAP] {src_ip}:{src_port} <-> {PUBLIC_IP}:{nat_port} (Proto: {proto}) [libres: {len(self.free_ports)}]")
         return nat_port
 
     def release_port(self, nat_port, proto):
@@ -206,7 +229,9 @@ class PATManager(object):
             src_ip, src_port = self.inbound_map.pop(key)
             self.outbound_map.pop((src_ip, src_port, proto), None)
             self.free_ports.add(nat_port)
-            log_color(YELLOW, f"[PAT RELEASE] Puerto {nat_port} devuelto al pool")
+            log_color(YELLOW, f"[PAT RELEASE] Puerto {nat_port} ({src_ip}:{src_port}, Proto: {proto}) devuelto al pool [libres: {len(self.free_ports)}]")
+        else:
+            log.debug(f"[PAT RELEASE] Ignorado: no existe mapeo para puerto {nat_port} (Proto: {proto})")
 
 
 class ProtoRouter(object):
@@ -216,23 +241,29 @@ class ProtoRouter(object):
         self.arp_mgr = ARPManager()
         self.pat_mgr = PATManager()
         self.arp_mgr.addListeners(self)
+        log_color(GREEN, f"[ROUTER] ProtoRouter inicializado (dpid={getattr(connection, 'dpid', '?')}, idle_timeout={FLOW_IDLE_TIMEOUT}s)")
 
     def _handle_ARPRemoved(self, event):
         log_color(YELLOW, f"[ARP EXPIRE] {event.ip} -> {event.mac} (Puerto {event.port})")
 
     def _handle_ConnectionDown(self, event):
+        log_color(RED, "[ROUTER] Conexión OpenFlow cerrada; liberando recursos")
         self.arp_mgr.shutdown()
+        log_color(RED, "[ROUTER] Recursos liberados")
 
     def _handle_PacketIn(self, event):
         if not event.parsed.parsed:
+            log.debug(f"[PKT IN] Paquete no parseado en puerto {getattr(event, 'port', '?')}; ignorado")
             return
 
         packet = event.parsed
+        log.debug(f"[PKT IN] dpid={getattr(self.connection, 'dpid', '?')} puerto={event.port} tipo=0x{packet.type:04x} src={packet.src} dst={packet.dst}")
 
         # 1. Tráfico ARP
         if packet.type == ethernet.ARP_TYPE:
             pending_events = self.arp_mgr.handle_arp(self.connection, event)
             if pending_events:
+                log_color(CYAN, f"[ROUTER] Reprocesando {len(pending_events)} paquete(s) pendiente(s)")
                 for pending_ev in pending_events:
                     self._handle_PacketIn(pending_ev)
             return
@@ -240,6 +271,9 @@ class ProtoRouter(object):
         # 2. Tráfico IP
         if packet.type == ethernet.IP_TYPE:
             self.process_ip(event)
+            return
+
+        log_color(YELLOW, f"[PKT IN] Ethertype no soportado 0x{packet.type:04x} desde {packet.src} hacia {packet.dst}; ignorado")
 
     def process_ip(self, event):
         packet = event.parsed
@@ -247,11 +281,13 @@ class ProtoRouter(object):
         in_port = event.port
 
         if not ip_pkt:
+            log.warning(f"[IP] Paquete IP inválido o no parseable en puerto {in_port}; ignorado")
             return
 
         proto = ip_pkt.protocol
         src_ip = ip_pkt.srcip
         dst_ip = ip_pkt.dstip
+        log.debug(f"[IP] {src_ip} -> {dst_ip} proto={proto} in_port={in_port}")
 
         # 0. Tráfico ICMP dirigido a las propias IPs del Router (Ping al Gateway)
         if dst_ip == PRIVATE_IP or dst_ip == PUBLIC_IP:
@@ -281,6 +317,11 @@ class ProtoRouter(object):
                 msg.in_port = in_port
                 msg.actions.append(of.ofp_action_output(port=of.OFPP_IN_PORT))
                 self.connection.send(msg)
+                log.debug(f"[ICMP Router] Reply enviado a {src_ip} por puerto {in_port}")
+            elif icmp_pkt:
+                log.debug(f"[ICMP Router] ICMP tipo {icmp_pkt.type} para {dst_ip}; no se responde")
+            else:
+                log.debug(f"[IP] Paquete no ICMP para IP del router {dst_ip} proto={proto}; no se procesa")
             return
 
         # 0.5. Tráfico LAN Local sin NAT (Privado -> Privado, ej: h3 -> h2)
@@ -292,6 +333,7 @@ class ProtoRouter(object):
             msg.in_port = in_port
 
             if dst_port:
+                log_color(CYAN, f"[LAN] {src_ip} -> {dst_ip} por puerto {dst_port}")
                 msg.actions.append(of.ofp_action_output(port=dst_port))
                 # Instalar flujo directo L2/L3 en el switch para conmutación local rápida
                 fm = of.ofp_flow_mod()
@@ -302,7 +344,9 @@ class ProtoRouter(object):
                 fm.match.nw_dst = dst_ip
                 fm.actions.append(of.ofp_action_output(port=dst_port))
                 self.connection.send(fm)
+                log.debug(f"[FLOW] LAN instalado: {src_ip} -> {dst_ip} (in={in_port}, out={dst_port}, idle={FLOW_IDLE_TIMEOUT}s)")
             else:
+                log_color(YELLOW, f"[LAN] MAC desconocida para {dst_ip}; inundando la LAN")
                 msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
 
             self.connection.send(msg)
@@ -310,10 +354,13 @@ class ProtoRouter(object):
 
         # 1. Tráfico Saliente (Red Privada -> Red Pública con NAT/PAT)
         if src_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
+            log_color(CYAN, f"[NAT] Saliente {src_ip} -> {dst_ip} proto={proto} in_port={in_port}")
             # Obtener/Resolver MAC de Destino
             dst_entry = self.arp_mgr.arp_table.get(dst_ip)
             dst_mac = dst_entry.mac if dst_entry else None
             if not dst_mac:
+                queued = len(self.arp_mgr.pending_packets[dst_ip]) + 1
+                log_color(YELLOW, f"[NAT] MAC desconocida para {dst_ip}; encolando paquete ({queued} pendiente(s)) y solicitando ARP")
                 self.arp_mgr.pending_packets[dst_ip].append(event)
                 self.arp_mgr.request_mac(self.connection, PUBLIC_PORT, PUBLIC_MAC, PUBLIC_IP, dst_ip)
                 return
@@ -324,6 +371,7 @@ class ProtoRouter(object):
             if l4_pkt:
                 src_port = l4_pkt.srcport
                 dst_port = l4_pkt.dstport
+                log_color(CYAN, f"[NAT] TCP/UDP {src_ip}:{src_port} -> {dst_ip}:{dst_port} proto={proto}")
 
                 nat_port = self.pat_mgr.get_or_assign(src_ip, src_port, proto)
                 if not nat_port:
@@ -346,6 +394,7 @@ class ProtoRouter(object):
                 fm_out.actions.append(of.ofp_action_tp_port.set_src(nat_port))
                 fm_out.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
                 self.connection.send(fm_out)
+                log.debug(f"[FLOW] NAT saliente instalado: {src_ip}:{src_port} -> {dst_ip}:{dst_port} (out={PUBLIC_PORT}, idle={FLOW_IDLE_TIMEOUT}s)")
 
                 # Flujo Entrante
                 fm_in = of.ofp_flow_mod()
@@ -365,6 +414,7 @@ class ProtoRouter(object):
                 fm_in.actions.append(of.ofp_action_tp_port.set_dst(src_port))
                 fm_in.actions.append(of.ofp_action_output(port=in_port))
                 self.connection.send(fm_in)
+                log.debug(f"[FLOW] NAT entrante instalado: {dst_ip}:{dst_port} -> {PUBLIC_IP}:{nat_port} (out={in_port}, idle={FLOW_IDLE_TIMEOUT}s)")
 
                 # Reenviar primer paquete (PacketOut)
                 msg = of.ofp_packet_out()
@@ -372,9 +422,11 @@ class ProtoRouter(object):
                 msg.in_port = in_port
                 msg.actions = fm_out.actions
                 self.connection.send(msg)
+                log.debug(f"[NAT] Primer paquete TCP/UDP reenviado a {dst_ip}")
 
             # Caso ICMP / Ping atravesando NAT
             elif packet.find('icmp'):
+                log_color(CYAN, f"[NAT] ICMP {src_ip} -> {dst_ip} proto={proto}")
                 fm_out = of.ofp_flow_mod()
                 fm_out.idle_timeout = FLOW_IDLE_TIMEOUT
                 fm_out.match.in_port = in_port
@@ -388,6 +440,7 @@ class ProtoRouter(object):
                 fm_out.actions.append(of.ofp_action_nw_addr.set_src(PUBLIC_IP))
                 fm_out.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
                 self.connection.send(fm_out)
+                log.debug(f"[FLOW] NAT ICMP saliente instalado: {src_ip} -> {dst_ip} (out={PUBLIC_PORT}, idle={FLOW_IDLE_TIMEOUT}s)")
 
                 fm_in = of.ofp_flow_mod()
                 fm_in.idle_timeout = FLOW_IDLE_TIMEOUT
@@ -402,21 +455,35 @@ class ProtoRouter(object):
                 fm_in.actions.append(of.ofp_action_nw_addr.set_dst(src_ip))
                 fm_in.actions.append(of.ofp_action_output(port=in_port))
                 self.connection.send(fm_in)
+                log.debug(f"[FLOW] NAT ICMP entrante instalado: {dst_ip} -> {PUBLIC_IP} (out={in_port}, idle={FLOW_IDLE_TIMEOUT}s)")
 
                 msg = of.ofp_packet_out()
                 msg.data = event.ofp
                 msg.in_port = in_port
                 msg.actions = fm_out.actions
                 self.connection.send(msg)
+                log.debug(f"[NAT] Primer paquete ICMP reenviado a {dst_ip}")
+
+            else:
+                log_color(YELLOW, f"[NAT] Protocolo {proto} no soportado para {src_ip} -> {dst_ip}; descartado")
+
+        else:
+            log_color(YELLOW, f"[IP] Tráfico no clasificado {src_ip} -> {dst_ip} proto={proto}; descartado")
 
     def _handle_FlowRemoved(self, event):
         """Libera los puertos PAT cuando expiran las reglas."""
         ofp = event.ofp
-        if ofp.match.dl_type == 0x0800 and ofp.match.nw_dst == PUBLIC_IP:
-            nat_port = ofp.match.tp_dst
-            proto = ofp.match.nw_proto
+        match = getattr(ofp, 'match', None)
+        log.debug(f"[FLOW REMOVED] reason={getattr(ofp, 'reason', '?')} idle_timeout={getattr(ofp, 'idle_timeout', '?')} hard_timeout={getattr(ofp, 'hard_timeout', '?')}")
+
+        if match and match.dl_type == 0x0800 and match.nw_dst == PUBLIC_IP:
+            nat_port = match.tp_dst
+            proto = match.nw_proto
+            log.debug(f"[FLOW REMOVED] NAT: {match.nw_src}:{getattr(match, 'tp_src', '?')} -> {match.nw_dst}:{getattr(match, 'tp_dst', '?')} proto={proto}")
             if nat_port and proto:
                 self.pat_mgr.release_port(nat_port, proto)
+        else:
+            log.debug("[FLOW REMOVED] Flujo sin traducción PAT asociada")
 
 
 def launch():
@@ -424,4 +491,5 @@ def launch():
         log_color(YELLOW, f"Iniciando ProtoRouter NAT/PAT en Switch {event.connection.dpid}")
         ProtoRouter(event.connection)
 
+    log_color(CYAN, "[ROUTER] Esperando conexiones OpenFlow...")
     core.openflow.addListenerByName("ConnectionUp", start_switch)
