@@ -5,7 +5,10 @@ from pox.lib.packet.ethernet import ethernet
 from pox.lib.packet.arp import arp
 from pox.lib.packet.ipv4 import ipv4
 from pox.lib.packet.icmp import icmp
+from pox.lib.recoco import Timer
+from pox.lib.revent import Event, EventMixin
 from collections import defaultdict
+import time
 
 log = core.getLogger()
 # TODO explicar que significa cada color
@@ -32,15 +35,62 @@ PUBLIC_PORT = 1
 
 FLOW_IDLE_TIMEOUT = 30  # Timeout de inactividad para liberar flujos en segundos
 
-# TODO no se limpia tabla ARP
+ARP_TIMEOUT = 5  # Tiempo de vida de una entrada ARP sin actualizarse
+ARP_CLEAN_INTERVAL = 3  # Intervalo de limpieza de la tabla ARP en segundos
 
-class ARPManager(object):
+
+class ARPEntry(object):
+    """Entrada de la tabla ARP con su última actualización y puerto físico."""
+
+    def __init__(self, mac, port):
+        self.mac = mac
+        self.port = port
+        self.last_seen = time.time()
+
+    def refresh(self, mac=None, port=None):
+        if mac is not None:
+            self.mac = mac
+        if port is not None:
+            self.port = port
+        self.last_seen = time.time()
+
+    @property
+    def expired(self):
+        return time.time() - self.last_seen > ARP_TIMEOUT
+
+
+class ARPRemoved(Event):
+    """Evento emitido cuando una entrada ARP expira."""
+
+    def __init__(self, ip, mac, port):
+        Event.__init__(self)
+        self.ip = ip
+        self.mac = mac
+        self.port = port
+
+
+class ARPManager(EventMixin):
     """Mantiene la tabla ARP dinámica, mapeo de puertos LAN, responde consultas al router y encola paquetes."""
 
+    _eventMixin_events = {ARPRemoved}
+
     def __init__(self):
-        self.arp_table = {}  # IPAddr -> EthAddr
-        self.ip_to_port = {}  # IPAddr -> port (int)
+        EventMixin.__init__(self)
+        self.arp_table = {}  # IPAddr -> ARPEntry
         self.pending_packets = defaultdict(list)  # IPAddr -> list(events)
+        self._cleaner = Timer(ARP_CLEAN_INTERVAL, self._expire_entries, recurring=True)
+
+    def _expire_entries(self):
+        for ip, entry in list(self.arp_table.items()):
+            if entry.expired:
+                del self.arp_table[ip]
+                self.pending_packets.pop(ip, None)
+                self.raiseEvent(ARPRemoved, ip, entry.mac, entry.port)
+
+    def shutdown(self):
+        if self._cleaner:
+            self._cleaner.cancel()
+            self._cleaner = None
 
     def handle_arp(self, connection, event):
         packet = event.parsed
@@ -51,8 +101,11 @@ class ARPManager(object):
             return None
 
         # Aprender dirección MAC y Puerto físico del emisor
-        self.arp_table[arp_pkt.protosrc] = arp_pkt.hwsrc
-        self.ip_to_port[arp_pkt.protosrc] = in_port
+        entry = self.arp_table.get(arp_pkt.protosrc)
+        if entry is None:
+            self.arp_table[arp_pkt.protosrc] = ARPEntry(arp_pkt.hwsrc, in_port)
+        else:
+            entry.refresh(arp_pkt.hwsrc, in_port)
 
         # 1. ARP Request
         if arp_pkt.opcode == arp.REQUEST:
@@ -76,7 +129,8 @@ class ARPManager(object):
 
             # Reenviar respuesta ARP local si no era para las IPs del router
             if arp_pkt.protodst != PRIVATE_IP and arp_pkt.protodst != PUBLIC_IP:
-                dst_port = self.ip_to_port.get(arp_pkt.protodst, of.OFPP_FLOOD)
+                reply_entry = self.arp_table.get(arp_pkt.protodst)
+                dst_port = reply_entry.port if reply_entry else of.OFPP_FLOOD
                 msg = of.ofp_packet_out()
                 msg.data = event.ofp
                 msg.in_port = in_port
@@ -161,6 +215,13 @@ class ProtoRouter(object):
         connection.addListeners(self)
         self.arp_mgr = ARPManager()
         self.pat_mgr = PATManager()
+        self.arp_mgr.addListeners(self)
+
+    def _handle_ARPRemoved(self, event):
+        log_color(YELLOW, f"[ARP EXPIRE] {event.ip} -> {event.mac} (Puerto {event.port})")
+
+    def _handle_ConnectionDown(self, event):
+        self.arp_mgr.shutdown()
 
     def _handle_PacketIn(self, event):
         if not event.parsed.parsed:
@@ -192,9 +253,6 @@ class ProtoRouter(object):
         src_ip = ip_pkt.srcip
         dst_ip = ip_pkt.dstip
 
-        # Registrar puerto físico del emisor
-        self.arp_mgr.ip_to_port[src_ip] = in_port
-
         # 0. Tráfico ICMP dirigido a las propias IPs del Router (Ping al Gateway)
         if dst_ip == PRIVATE_IP or dst_ip == PUBLIC_IP:
             icmp_pkt = packet.find('icmp')
@@ -221,13 +279,14 @@ class ProtoRouter(object):
                 msg = of.ofp_packet_out()
                 msg.data = reply_eth.pack()
                 msg.in_port = in_port
-                msg.actions.append(of.ofp_action_output(port=in_port))
+                msg.actions.append(of.ofp_action_output(port=of.OFPP_IN_PORT))
                 self.connection.send(msg)
             return
 
         # 0.5. Tráfico LAN Local sin NAT (Privado -> Privado, ej: h3 -> h2)
         if src_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK) and dst_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
-            dst_port = self.arp_mgr.ip_to_port.get(dst_ip)
+            dst_entry = self.arp_mgr.arp_table.get(dst_ip)
+            dst_port = dst_entry.port if dst_entry else None
             msg = of.ofp_packet_out()
             msg.data = event.ofp
             msg.in_port = in_port
@@ -250,10 +309,10 @@ class ProtoRouter(object):
             return
 
         # 1. Tráfico Saliente (Red Privada -> Red Pública con NAT/PAT)
-        # TODO agregar entrada ARP para MAC externa
         if src_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
             # Obtener/Resolver MAC de Destino
-            dst_mac = self.arp_mgr.arp_table.get(dst_ip)
+            dst_entry = self.arp_mgr.arp_table.get(dst_ip)
+            dst_mac = dst_entry.mac if dst_entry else None
             if not dst_mac:
                 self.arp_mgr.pending_packets[dst_ip].append(event)
                 self.arp_mgr.request_mac(self.connection, PUBLIC_PORT, PUBLIC_MAC, PUBLIC_IP, dst_ip)
