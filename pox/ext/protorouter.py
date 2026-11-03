@@ -8,9 +8,11 @@ from pox.lib.packet.icmp import icmp
 from pox.lib.recoco import Timer
 from pox.lib.revent import Event, EventMixin
 from collections import defaultdict
+# [MONITOR ARP/NAT] Import exclusivo del monitor; no afecta el comportamiento del protorouter.
 import threading
 import time
 # TODO: no cerrar el popup antes del protorouter
+# TODO: agregar un env para variables de configuracion (timeouts)
 log = core.getLogger()
 # Estilos para Logs
 #
@@ -114,6 +116,7 @@ class ARPManager(EventMixin):
             self._cleaner.cancel()
             self._cleaner = None
 
+    # [MONITOR ARP/NAT] Método exclusivo del monitor; no afecta el comportamiento del protorouter.
     def snapshot(self):
         """Devuelve una copia de la tabla ARP para monitoreo."""
         return [
@@ -228,9 +231,11 @@ class PATManager(object):
         self.free_ports = set(range(start_port, end_port + 1))
         self.outbound_map = {}  # (src_ip, src_port, proto) -> nat_port
         self.inbound_map = {}  # (nat_port, proto) -> (src_ip, src_port)
+        # [MONITOR ARP/NAT] Dato adicional para mostrar el destino en la ventana; no afecta el mapeo PAT.
         self.destination_map = {}  # (src_ip, src_port, proto) -> (dst_ip, dst_port)
         log_color(MAGENTA, f"[PAT] Pool inicializado: {start_port}-{end_port} ({len(self.free_ports)} puertos libres)")
 
+    # [MONITOR ARP/NAT] Método exclusivo del monitor; no afecta el comportamiento del protorouter.
     def snapshot(self):
         """Devuelve una copia de los mapeos NAT/PAT para monitoreo."""
         entries = []
@@ -240,6 +245,7 @@ class PATManager(object):
             entries.append((src_ip, src_port, proto, nat_port, dst_ip, dst_port))
         return entries
 
+    # [MONITOR ARP/NAT] Método exclusivo del monitor; no afecta el comportamiento del protorouter.
     def free_count(self):
         """Cantidad de puertos PAT disponibles."""
         return len(self.free_ports)
@@ -248,6 +254,7 @@ class PATManager(object):
         key = (src_ip, src_port, proto)
 
         if key in self.outbound_map:
+            # [MONITOR ARP/NAT] Solo guarda el destino para la ventana; no altera el mapeo PAT.
             if dst_ip is not None or dst_port is not None:
                 self.destination_map[key] = (dst_ip, dst_port)
             nat_port = self.outbound_map[key]
@@ -261,6 +268,7 @@ class PATManager(object):
         nat_port = self.free_ports.pop()
         self.outbound_map[key] = nat_port
         self.inbound_map[(nat_port, proto)] = (src_ip, src_port)
+        # [MONITOR ARP/NAT] Solo guarda el destino para la ventana; no altera el mapeo PAT.
         if dst_ip is not None or dst_port is not None:
             self.destination_map[key] = (dst_ip, dst_port)
         log_color(GREEN, f"[PAT MAP] {src_ip}:{src_port} <-> {PUBLIC_IP}:{nat_port} (Proto: {proto}) [libres: {len(self.free_ports)}]")
@@ -271,6 +279,7 @@ class PATManager(object):
         if key in self.inbound_map:
             src_ip, src_port = self.inbound_map.pop(key)
             self.outbound_map.pop((src_ip, src_port, proto), None)
+            # [MONITOR ARP/NAT] Limpia el dato mostrado en la ventana; no afecta el mapeo PAT.
             self.destination_map.pop((src_ip, src_port, proto), None)
             self.free_ports.add(nat_port)
             log_color(YELLOW, f"[PAT RELEASE] Puerto {nat_port} ({src_ip}:{src_port}, Proto: {proto}) devuelto al pool [libres: {len(self.free_ports)}]")
@@ -278,6 +287,7 @@ class PATManager(object):
             log.debug(f"[PAT RELEASE] Ignorado: no existe mapeo para puerto {nat_port} (Proto: {proto})")
 
 
+# [MONITOR ARP/NAT] Clase exclusiva del monitor visual; no participa del ruteo ni del NAT.
 class TablesPopupMonitor(object):
     """Ventana Tkinter con las tablas ARP y NAT/PAT del router."""
 
@@ -474,6 +484,7 @@ class ProtoRouter(object):
         self.arp_mgr = ARPManager()
         self.pat_mgr = PATManager()
         self.arp_mgr.addListeners(self)
+        # [MONITOR ARP/NAT] Abre la ventana del monitor; el router funciona igual si falla.
         self.tables_popup = TablesPopupMonitor(self.arp_mgr, self.pat_mgr, getattr(connection, "dpid", "?"))
         log_color(MAGENTA, f"[ROUTER] ProtoRouter inicializado (dpid={getattr(connection, 'dpid', '?')}, idle_timeout={FLOW_IDLE_TIMEOUT}s)")
 
@@ -482,6 +493,7 @@ class ProtoRouter(object):
 
     def _handle_ConnectionDown(self, event):
         log_color(MAGENTA, "[ROUTER] Conexión OpenFlow cerrada; liberando recursos")
+        # [MONITOR ARP/NAT] Detiene solo la ventana del monitor; no afecta la liberación del router.
         if getattr(self, "tables_popup", None) is not None:
             self.tables_popup.stop()
         self.arp_mgr.shutdown()
@@ -609,6 +621,7 @@ class ProtoRouter(object):
                 dst_port = l4_pkt.dstport
                 log_color(CYAN, f"[NAT] TCP/UDP {src_ip}:{src_port} -> {dst_ip}:{dst_port} proto={proto}")
 
+                # [MONITOR ARP/NAT] Envía IP/puerto destino solo para poder mostrarlos en la ventana.
                 nat_port = self.pat_mgr.get_or_assign(src_ip, src_port, proto, dst_ip, dst_port)
                 if not nat_port:
                     return
