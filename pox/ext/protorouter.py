@@ -8,8 +8,9 @@ from pox.lib.packet.icmp import icmp
 from pox.lib.recoco import Timer
 from pox.lib.revent import Event, EventMixin
 from collections import defaultdict
+import threading
 import time
-
+# TODO: no cerrar el popup antes del protorouter
 log = core.getLogger()
 # Estilos para Logs
 #
@@ -112,6 +113,13 @@ class ARPManager(EventMixin):
             log_color(MAGENTA, "[ARP] Deteniendo limpieza periódica de la tabla ARP")
             self._cleaner.cancel()
             self._cleaner = None
+
+    def snapshot(self):
+        """Devuelve una copia de la tabla ARP para monitoreo."""
+        return [
+            (ip, entry.mac, entry.port, entry.last_seen)
+            for ip, entry in self.arp_table.copy().items()
+        ]
 
     def handle_arp(self, connection, event):
         packet = event.parsed
@@ -220,11 +228,28 @@ class PATManager(object):
         self.free_ports = set(range(start_port, end_port + 1))
         self.outbound_map = {}  # (src_ip, src_port, proto) -> nat_port
         self.inbound_map = {}  # (nat_port, proto) -> (src_ip, src_port)
+        self.destination_map = {}  # (src_ip, src_port, proto) -> (dst_ip, dst_port)
         log_color(MAGENTA, f"[PAT] Pool inicializado: {start_port}-{end_port} ({len(self.free_ports)} puertos libres)")
 
-    def get_or_assign(self, src_ip, src_port, proto):
+    def snapshot(self):
+        """Devuelve una copia de los mapeos NAT/PAT para monitoreo."""
+        entries = []
+        for key, nat_port in self.outbound_map.copy().items():
+            src_ip, src_port, proto = key
+            dst_ip, dst_port = self.destination_map.get(key, (None, None))
+            entries.append((src_ip, src_port, proto, nat_port, dst_ip, dst_port))
+        return entries
+
+    def free_count(self):
+        """Cantidad de puertos PAT disponibles."""
+        return len(self.free_ports)
+
+    def get_or_assign(self, src_ip, src_port, proto, dst_ip=None, dst_port=None):
         key = (src_ip, src_port, proto)
+
         if key in self.outbound_map:
+            if dst_ip is not None or dst_port is not None:
+                self.destination_map[key] = (dst_ip, dst_port)
             nat_port = self.outbound_map[key]
             log_color(CYAN, f"[PAT HIT] {src_ip}:{src_port} (Proto: {proto}) ya mapeado a {PUBLIC_IP}:{nat_port}")
             return nat_port
@@ -236,6 +261,8 @@ class PATManager(object):
         nat_port = self.free_ports.pop()
         self.outbound_map[key] = nat_port
         self.inbound_map[(nat_port, proto)] = (src_ip, src_port)
+        if dst_ip is not None or dst_port is not None:
+            self.destination_map[key] = (dst_ip, dst_port)
         log_color(GREEN, f"[PAT MAP] {src_ip}:{src_port} <-> {PUBLIC_IP}:{nat_port} (Proto: {proto}) [libres: {len(self.free_ports)}]")
         return nat_port
 
@@ -244,10 +271,200 @@ class PATManager(object):
         if key in self.inbound_map:
             src_ip, src_port = self.inbound_map.pop(key)
             self.outbound_map.pop((src_ip, src_port, proto), None)
+            self.destination_map.pop((src_ip, src_port, proto), None)
             self.free_ports.add(nat_port)
             log_color(YELLOW, f"[PAT RELEASE] Puerto {nat_port} ({src_ip}:{src_port}, Proto: {proto}) devuelto al pool [libres: {len(self.free_ports)}]")
         else:
             log.debug(f"[PAT RELEASE] Ignorado: no existe mapeo para puerto {nat_port} (Proto: {proto})")
+
+
+class TablesPopupMonitor(object):
+    """Ventana Tkinter con las tablas ARP y NAT/PAT del router."""
+
+    REFRESH_INTERVAL_MS = 1000
+    TABLES = ("ARP", "NAT/PAT")
+
+    def __init__(self, arp_mgr, pat_mgr, dpid="?"):
+        self.arp_mgr = arp_mgr
+        self.pat_mgr = pat_mgr
+        self.dpid = dpid
+        self._root = None
+        self._text = None
+        self._table_var = None
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"TablesPopupMonitor-{dpid}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self):
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+        except Exception as exc:
+            log_color(YELLOW, f"[POPUP] Tkinter no disponible: {exc}")
+            return
+
+        try:
+            root = tk.Tk()
+            root.title(f"ProtoRouter - Tablas ARP / NAT (dpid={self.dpid})")
+            root.geometry("720x420")
+            root.minsize(560, 260)
+            root.configure(background="#111111")
+            root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+            controls = tk.Frame(root, background="#111111")
+            controls.pack(fill="x", padx=8, pady=(8, 0))
+
+            label = tk.Label(
+                controls,
+                text="Tabla:",
+                background="#111111",
+                foreground="#00ff88",
+                font=("Courier", 10),
+            )
+            label.pack(side="left")
+
+            self._table_var = tk.StringVar(master=root, value=self.TABLES[0])
+            combo = ttk.Combobox(
+                controls,
+                textvariable=self._table_var,
+                values=self.TABLES,
+                state="readonly",
+                width=12,
+            )
+            combo.pack(side="left", padx=6)
+            combo.bind("<<ComboboxSelected>>", self._on_table_changed)
+
+            text = tk.Text(
+                root,
+                font=("Courier", 10),
+                background="#111111",
+                foreground="#00ff88",
+                insertbackground="#00ff88",
+                borderwidth=0,
+                highlightthickness=0,
+            )
+            text.pack(fill="both", expand=True, padx=8, pady=8)
+            text.configure(state="disabled")
+
+            self._root = root
+            self._text = text
+            self._refresh()
+            self._schedule_refresh()
+            log_color(MAGENTA, f"[POPUP] Ventana abierta (dpid={self.dpid})")
+            root.mainloop()
+        except Exception as exc:
+            log_color(YELLOW, f"[POPUP] No se pudo abrir la ventana: {exc}")
+        finally:
+            self._destroy()
+
+    def _on_table_changed(self, event=None):
+        self._refresh()
+
+    def _schedule_refresh(self):
+        if self._closed or self._root is None:
+            return
+        self._root.after(self.REFRESH_INTERVAL_MS, self._tick)
+
+    def _tick(self):
+        if self._closed or self._root is None:
+            self._destroy()
+            return
+
+        try:
+            self._refresh()
+            self._schedule_refresh()
+        except Exception as exc:
+            log_color(YELLOW, f"[POPUP] Ventana cerrada o error: {exc}")
+            self._on_close()
+
+    def _refresh(self):
+        if self._text is None:
+            return
+
+        now = time.time()
+        selected = self._table_var.get() if self._table_var is not None else self.TABLES[0]
+
+        if selected == "NAT/PAT":
+            lines = self._format_nat(now)
+        else:
+            lines = self._format_arp(now)
+
+        self._text.configure(state="normal")
+        self._text.delete("1.0", "end")
+        self._text.insert("1.0", "\n".join(lines))
+        self._text.configure(state="disabled")
+
+    def _format_arp(self, now):
+        entries = self.arp_mgr.snapshot()
+        stamp = time.strftime("%H:%M:%S", time.localtime(now))
+        lines = [
+            "ProtoRouter - Tabla ARP",
+            f"dpid: {self.dpid}    entradas: {len(entries)}    hora: {stamp}",
+            "",
+            f"{'IP':<16} {'MAC':<18} {'PUERTO':<7} {'EDAD':>8}",
+            "-" * 55,
+        ]
+
+        if not entries:
+            lines.append("(sin entradas ARP)")
+        else:
+            for ip, mac, port, last_seen in sorted(entries, key=lambda item: str(item[0])):
+                age = max(0.0, now - last_seen)
+                lines.append(f"{str(ip):<16} {str(mac):<18} {str(port):<7} {age:>7.1f}s")
+
+        return lines
+
+    def _format_nat(self, now):
+        entries = self.pat_mgr.snapshot()
+        stamp = time.strftime("%H:%M:%S", time.localtime(now))
+        lines = [
+            "ProtoRouter - Tabla NAT/PAT",
+            f"dpid: {self.dpid}    mapeos: {len(entries)}    puertos libres: {self.pat_mgr.free_count()}    hora: {stamp}",
+            "",
+            f"{'IP PRIVADA':<16} {'PUERTO':<8} {'PROTO':<6} {'IP DESTINO':<16} {'PUERTO DEST':>11} {'IP PUBLICA':<16} {'PUERTO PUB':>10}",
+            "-" * 89,
+        ]
+
+        if not entries:
+            lines.append("(sin mapeos NAT/PAT)")
+        else:
+            for src_ip, src_port, proto, nat_port, dst_ip, dst_port in sorted(
+                entries, key=lambda item: (str(item[0]), item[1], item[2])
+            ):
+                dst_ip_text = str(dst_ip) if dst_ip is not None else "-"
+                dst_port_text = str(dst_port) if dst_port is not None else "-"
+                lines.append(
+                    f"{str(src_ip):<16} {str(src_port):<8} {self._proto_name(proto):<6} "
+                    f"{dst_ip_text:<16} {dst_port_text:>11} {str(PUBLIC_IP):<16} {str(nat_port):>10}"
+                )
+
+        return lines
+
+    def _proto_name(self, proto):
+        return {1: "ICMP", 6: "TCP", 17: "UDP"}.get(proto, str(proto))
+
+    def _destroy(self):
+        root = self._root
+        self._root = None
+        self._text = None
+
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            log_color(MAGENTA, f"[POPUP] Ventana cerrada (dpid={self.dpid})")
+
+    def _on_close(self):
+        self._closed = True
+        self._destroy()
+
+    def stop(self):
+        self._closed = True
 
 
 class ProtoRouter(object):
@@ -257,6 +474,7 @@ class ProtoRouter(object):
         self.arp_mgr = ARPManager()
         self.pat_mgr = PATManager()
         self.arp_mgr.addListeners(self)
+        self.tables_popup = TablesPopupMonitor(self.arp_mgr, self.pat_mgr, getattr(connection, "dpid", "?"))
         log_color(MAGENTA, f"[ROUTER] ProtoRouter inicializado (dpid={getattr(connection, 'dpid', '?')}, idle_timeout={FLOW_IDLE_TIMEOUT}s)")
 
     def _handle_ARPRemoved(self, event):
@@ -264,6 +482,8 @@ class ProtoRouter(object):
 
     def _handle_ConnectionDown(self, event):
         log_color(MAGENTA, "[ROUTER] Conexión OpenFlow cerrada; liberando recursos")
+        if getattr(self, "tables_popup", None) is not None:
+            self.tables_popup.stop()
         self.arp_mgr.shutdown()
         log_color(MAGENTA, "[ROUTER] Recursos liberados")
 
@@ -389,7 +609,7 @@ class ProtoRouter(object):
                 dst_port = l4_pkt.dstport
                 log_color(CYAN, f"[NAT] TCP/UDP {src_ip}:{src_port} -> {dst_ip}:{dst_port} proto={proto}")
 
-                nat_port = self.pat_mgr.get_or_assign(src_ip, src_port, proto)
+                nat_port = self.pat_mgr.get_or_assign(src_ip, src_port, proto, dst_ip, dst_port)
                 if not nat_port:
                     return
 
