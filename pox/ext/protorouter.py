@@ -260,7 +260,6 @@ class PATManager(object):
     def register_icmp(self, src_ip, dst_ip, original_id, src_mac, in_port):
         """Busca o crea una traducción ICMP."""
 
-        self._expire_icmp_entries()
 
         key = (src_ip, dst_ip, original_id)
 
@@ -304,7 +303,6 @@ class PATManager(object):
     def get_icmp_by_translated_id(self, translated_id, remote_ip=None):
         """Busca la traducción correspondiente a una respuesta ICMP."""
 
-        self._expire_icmp_entries()
 
         entry = self.icmp_entries.get(translated_id)
 
@@ -340,14 +338,6 @@ class PATManager(object):
 
         return entry
 
-    def _expire_icmp_entries(self):
-        """Elimina las traducciones ICMP inactivas."""
-
-        now = time.time()
-
-        for translated_id, entry in list(self.icmp_entries.items()):
-            if now - entry["last_seen"] > FLOW_IDLE_TIMEOUT:
-                self.release_icmp(translated_id)
 
     # [MONITOR ARP/NAT] Método exclusivo del monitor; no afecta el comportamiento del protorouter.
     def snapshot(self):
@@ -361,8 +351,6 @@ class PATManager(object):
             entries.append((src_ip, src_port, proto, nat_port, dst_ip, dst_port))
 
         # entradas ICMP
-        self._expire_icmp_entries()
-
         for entry in self.icmp_entries.values():
             entries.append((
                 entry["src_ip"],
@@ -900,7 +888,9 @@ class ProtoRouter(object):
                 removed = self.pat_mgr.release_icmp(cookie)
 
                 if removed:
-                    src_ip, dst_ip = removed
+                    src_ip = removed["src_ip"]
+                    dst_ip = removed["dst_ip"]
+
                     log_color(
                         YELLOW,
                         f"[NAT ICMP EXPIRE] {src_ip} -> {dst_ip} (cookie={cookie})"
