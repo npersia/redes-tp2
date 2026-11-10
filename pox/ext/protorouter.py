@@ -52,7 +52,7 @@ PUBLIC_MAC = EthAddr("00:00:00:aa:aa:aa")
 PRIVATE_MAC = EthAddr("00:00:00:bb:bb:bb")
 PUBLIC_PORT = 1
 
-FLOW_IDLE_TIMEOUT = 30  # Timeout de inactividad para liberar flujos en segundos
+FLOW_IDLE_TIMEOUT = 5  # Timeout de inactividad para liberar flujos en segundos
 
 ARP_TIMEOUT = 5  # Tiempo de vida de una entrada ARP sin actualizarse
 ARP_CLEAN_INTERVAL = 3  # Intervalo de limpieza de la tabla ARP en segundos
@@ -233,16 +233,145 @@ class PATManager(object):
         self.inbound_map = {}  # (nat_port, proto) -> (src_ip, src_port)
         # [MONITOR ARP/NAT] Dato adicional para mostrar el destino en la ventana; no afecta el mapeo PAT.
         self.destination_map = {}  # (src_ip, src_port, proto) -> (dst_ip, dst_port)
+
+
+        # traducciones ICMP
+        self.icmp_entries = {}
+        self.icmp_outbound_map = {}
+        self._next_icmp_id = 1
+
         log_color(MAGENTA, f"[PAT] Pool inicializado: {start_port}-{end_port} ({len(self.free_ports)} puertos libres)")
+
+    def _allocate_icmp_id(self):
+        """Busca un identificador ICMP público disponible."""
+
+        for _ in range(65535):
+            candidate = self._next_icmp_id
+
+            self._next_icmp_id += 1
+            if self._next_icmp_id > 65535:
+                self._next_icmp_id = 1
+
+            if candidate not in self.icmp_entries:
+                return candidate
+
+        return None
+
+    def register_icmp(self, src_ip, dst_ip, original_id, src_mac, in_port):
+        """Busca o crea una traducción ICMP."""
+
+        self._expire_icmp_entries()
+
+        key = (src_ip, dst_ip, original_id)
+
+        # ¿Ya existe una traducción para este tráfico?
+        translated_id = self.icmp_outbound_map.get(key)
+
+        if translated_id is not None:
+            entry = self.icmp_entries[translated_id]
+            entry["last_seen"] = time.time()
+            entry["src_mac"] = src_mac
+            entry["in_port"] = in_port
+            return translated_id
+
+        # Crear una nueva traducción
+        translated_id = self._allocate_icmp_id()
+
+        if translated_id is None:
+            log_color(RED, "[NAT ICMP] Identificadores agotados")
+            return None
+
+        self.icmp_entries[translated_id] = {
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "original_id": original_id,
+            "translated_id": translated_id,
+            "src_mac": src_mac,
+            "in_port": in_port,
+            "last_seen": time.time()
+        }
+
+        self.icmp_outbound_map[key] = translated_id
+
+        log_color(
+            GREEN,
+            f"[NAT ICMP MAP] {src_ip} -> {dst_ip} "
+            f"ID {original_id} => {translated_id}"
+        )
+
+        return translated_id
+
+    def get_icmp_by_translated_id(self, translated_id, remote_ip=None):
+        """Busca la traducción correspondiente a una respuesta ICMP."""
+
+        self._expire_icmp_entries()
+
+        entry = self.icmp_entries.get(translated_id)
+
+        if entry is None:
+            return None
+
+        # Verificar que responda el destino al que enviamos el ping
+        if remote_ip is not None and entry["dst_ip"] != remote_ip:
+            return None
+
+        entry["last_seen"] = time.time()
+
+        return entry
+
+    def release_icmp(self, translated_id):
+        """Elimina una traducción ICMP."""
+
+        entry = self.icmp_entries.pop(translated_id, None)
+
+        if entry is not None:
+            key = (
+                entry["src_ip"],
+                entry["dst_ip"],
+                entry["original_id"]
+            )
+
+            self.icmp_outbound_map.pop(key, None)
+
+            log_color(
+                YELLOW,
+                f"[NAT ICMP RELEASE] ID {translated_id} liberado"
+            )
+
+        return entry
+
+    def _expire_icmp_entries(self):
+        """Elimina las traducciones ICMP inactivas."""
+
+        now = time.time()
+
+        for translated_id, entry in list(self.icmp_entries.items()):
+            if now - entry["last_seen"] > FLOW_IDLE_TIMEOUT:
+                self.release_icmp(translated_id)
 
     # [MONITOR ARP/NAT] Método exclusivo del monitor; no afecta el comportamiento del protorouter.
     def snapshot(self):
         """Devuelve una copia de los mapeos NAT/PAT para monitoreo."""
         entries = []
+
+        # entradas TCP y UDP
         for key, nat_port in self.outbound_map.copy().items():
             src_ip, src_port, proto = key
             dst_ip, dst_port = self.destination_map.get(key, (None, None))
             entries.append((src_ip, src_port, proto, nat_port, dst_ip, dst_port))
+
+        # entradas ICMP
+        self._expire_icmp_entries()
+
+        for entry in self.icmp_entries.values():
+            entries.append((
+                entry["src_ip"],
+                None,
+                ipv4.ICMP_PROTOCOL,
+                None,
+                entry["dst_ip"],
+                None
+            ))
         return entries
 
     # [MONITOR ARP/NAT] Método exclusivo del monitor; no afecta el comportamiento del protorouter.
@@ -443,13 +572,15 @@ class TablesPopupMonitor(object):
             lines.append("(sin mapeos NAT/PAT)")
         else:
             for src_ip, src_port, proto, nat_port, dst_ip, dst_port in sorted(
-                entries, key=lambda item: (str(item[0]), item[1], item[2])
+                    entries, key=lambda item: (str(item[0]), str(item[1]), str(item[2]))
             ):
                 dst_ip_text = str(dst_ip) if dst_ip is not None else "-"
                 dst_port_text = str(dst_port) if dst_port is not None else "-"
+                src_port_text = str(src_port) if src_port is not None else "-"
+                nat_port_text = str(nat_port) if nat_port is not None else "-"
                 lines.append(
-                    f"{str(src_ip):<16} {str(src_port):<8} {self._proto_name(proto):<6} "
-                    f"{dst_ip_text:<16} {dst_port_text:>11} {str(PUBLIC_IP):<16} {str(nat_port):>10}"
+                    f"{str(src_ip):<16} {src_port_text:<8} {self._proto_name(proto):<6} "
+                    f"{dst_ip_text:<16} {dst_port_text:>11} {str(PUBLIC_IP):<16} {nat_port_text:>10}"
                 )
 
         return lines
@@ -690,10 +821,38 @@ class ProtoRouter(object):
                 fm_out.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
                 self.connection.send(fm_out)
                 log_color(BLUE, f"[FLOW] NAT ICMP saliente instalado: {src_ip} -> {dst_ip} (out={PUBLIC_PORT}, idle={FLOW_IDLE_TIMEOUT}s)")
+                icmp_pkt = packet.find('icmp')
+                echo_pkt = packet.find('echo')
+
+
+
+                if icmp_pkt is None or icmp_pkt.type != 8 or echo_pkt is None:
+                    log_color(YELLOW, "[NAT ICMP] Paquete no es un Echo Request válido")
+                    return
+
+                icmp_cookie = self.pat_mgr.register_icmp(
+                    src_ip,
+                    dst_ip,
+                    echo_pkt.id,
+                    packet.src,
+                    in_port
+                )
+
+                if icmp_cookie is None:
+                    return
+
 
                 fm_in = of.ofp_flow_mod()
                 fm_in.idle_timeout = FLOW_IDLE_TIMEOUT
+
+                # asocia la regla openfow con la entrada ICMP del monitor
+                fm_in.cookie = icmp_cookie
+                fm_in.flags |= of.OFPFF_SEND_FLOW_REM
+
                 fm_in.match.in_port = PUBLIC_PORT
+
+
+
                 fm_in.match.dl_type = 0x0800
                 fm_in.match.nw_proto = proto
                 fm_in.match.nw_src = dst_ip
@@ -720,19 +879,49 @@ class ProtoRouter(object):
             log_color(YELLOW, f"[IP] Tráfico no clasificado {src_ip} -> {dst_ip} proto={proto}; descartado")
 
     def _handle_FlowRemoved(self, event):
-        """Libera los puertos PAT cuando expiran las reglas."""
+        """Libera los recursos NAT/PAT cuando expiran las reglas."""
+
         ofp = event.ofp
         match = getattr(ofp, 'match', None)
-        log.debug(f"[FLOW REMOVED] reason={getattr(ofp, 'reason', '?')} idle_timeout={getattr(ofp, 'idle_timeout', '?')} hard_timeout={getattr(ofp, 'hard_timeout', '?')}")
+
+        log.debug(
+            f"[FLOW REMOVED] reason={getattr(ofp, 'reason', '?')} "
+            f"idle_timeout={getattr(ofp, 'idle_timeout', '?')} "
+            f"hard_timeout={getattr(ofp, 'hard_timeout', '?')}"
+        )
 
         if match and match.dl_type == 0x0800 and match.nw_dst == PUBLIC_IP:
-            nat_port = match.tp_dst
+
             proto = match.nw_proto
-            log.debug(f"[FLOW REMOVED] NAT: {match.nw_src}:{getattr(match, 'tp_src', '?')} -> {match.nw_dst}:{getattr(match, 'tp_dst', '?')} proto={proto}")
-            if nat_port and proto:
-                self.pat_mgr.release_port(nat_port, proto)
+
+            # Caso ICMP
+            if proto == ipv4.ICMP_PROTOCOL:
+                cookie = ofp.cookie
+                removed = self.pat_mgr.release_icmp(cookie)
+
+                if removed:
+                    src_ip, dst_ip = removed
+                    log_color(
+                        YELLOW,
+                        f"[NAT ICMP EXPIRE] {src_ip} -> {dst_ip} (cookie={cookie})"
+                    )
+
+            # Caso TCP / UDP
+            else:
+                nat_port = match.tp_dst
+
+                log.debug(
+                    f"[FLOW REMOVED] NAT: {match.nw_src}:"
+                    f"{getattr(match, 'tp_src', '?')} -> "
+                    f"{match.nw_dst}:{getattr(match, 'tp_dst', '?')} "
+                    f"proto={proto}"
+                )
+
+                if nat_port and proto:
+                    self.pat_mgr.release_port(nat_port, proto)
+
         else:
-            log.debug("[FLOW REMOVED] Flujo sin traducción PAT asociada")
+            log.debug("[FLOW REMOVED] Flujo sin traducción NAT asociada")
 
 
 def launch():
