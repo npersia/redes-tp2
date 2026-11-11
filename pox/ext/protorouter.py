@@ -921,3 +921,18 @@ def launch():
 
     log_color(MAGENTA, "[ROUTER] Esperando conexiones OpenFlow...")
     core.openflow.addListenerByName("ConnectionUp", start_switch)
+
+
+"""
+TODO: Problemas encontrados
+1. ICMP multi-host: la traducción de Echo-ID nunca se aplica (viola 4.1 y 4.3). Este es el más grave. register_icmp calcula un translated_id (protorouter.py:821) y lo guarda en el cookie, pero:
+- El flujo saliente ICMP solo reescribe MAC e IP origen (protorouter.py:806-809) — nunca el ID del echo.
+- El packet_out del primer paquete manda el paquete original sin modificar (protorouter.py:856-860).
+- OpenFlow 1.0 no tiene acción para reescribir el ID ICMP, y el flujo entrante ICMP tampoco puede matchear por ID.
+Consecuencia: el flujo entrante ICMP (protorouter.py:840-847) matchea cualquier ICMP desde dst_ip hacia PUBLIC_IP sin distinguir host destino. Si h2, h3 y h4 pinguean simultáneamente a h1, los matches son idénticos, cada flow_mod reemplaza al anterior y todas las respuestas se enrutan al último host que instaló el flujo. La Prueba 2.2 del plan (pings simultáneos) falla. Para arreglarlo hay que procesar el ICMP en el controlador (reescritura del ID en el paquete antes del packet_out) en lugar de instalar flujos entrantes ICMP, o al menos no instalar flujo entrante ICMP y resolver cada reply vía tabla.
+
+TODO: Revisar lo siguiente:
+La key PAT es (src_ip, src_port, proto) sin destino (protorouter.py:371): dos conexiones desde el mismo host:puerto hacia destinos distintos comparten puerto público. Defendible (mapeo endpoint-independent, coincide con el Cuadro 1), pero como la liberación depende solo del flujo entrante, si ese destino no responde, el puerto compartido se libera y se reasigna a mitad de la otra conexión.
+TODO: Revisar lo siguiente:
+ARP requests locales se inunden también hacia el puerto público (protorouter.py:160).
+"""
