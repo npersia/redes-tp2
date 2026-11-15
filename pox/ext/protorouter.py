@@ -11,6 +11,7 @@ from collections import defaultdict
 # [MONITOR ARP/NAT] Import exclusivo del monitor; no afecta el comportamiento del protorouter.
 import threading
 import time
+from ext.config import FLOW_IDLE_TIMEOUT, ARP_TIMEOUT, ARP_CLEAN_INTERVAL, PRIVATE_SUBNET, PRIVATE_MASK, PRIVATE_IP_ROUTER as PRIVATE_IP, PUBLIC_IP_ROUTER as PUBLIC_IP, PUBLIC_MAC_ROUTER as PUBLIC_MAC, PRIVATE_MAC_ROUTER as PRIVATE_MAC, PUBLIC_PORT
 # TODO: no cerrar el popup antes del protorouter
 # TODO: agregar un env para variables de configuracion (timeouts)
 log = core.getLogger()
@@ -41,22 +42,6 @@ RESET = "\033[0m"
 
 def log_color(color, msg):
     log.info(f"{color}{msg}{RESET}")
-
-
-# Configuración de Red Base
-PRIVATE_SUBNET = IPAddr("192.168.1.0")
-PRIVATE_MASK = 24
-PRIVATE_IP = IPAddr("192.168.1.254")
-PUBLIC_IP = IPAddr("200.0.0.254")
-PUBLIC_MAC = EthAddr("00:00:00:aa:aa:aa")
-PRIVATE_MAC = EthAddr("00:00:00:bb:bb:bb")
-PUBLIC_PORT = 1
-
-FLOW_IDLE_TIMEOUT = 5  # Timeout de inactividad para liberar flujos en segundos
-
-ARP_TIMEOUT = 5  # Tiempo de vida de una entrada ARP sin actualizarse
-ARP_CLEAN_INTERVAL = 3  # Intervalo de limpieza de la tabla ARP en segundos
-
 
 class ARPEntry(object):
     """Entrada de la tabla ARP con su última actualización y puerto físico."""
@@ -263,7 +248,7 @@ class PATManager(object):
 
         key = (src_ip, dst_ip, original_id)
 
-        # ¿Ya existe una traducción para este tráfico?
+        # TODO: ¿Ya existe una traducción para este tráfico?
         translated_id = self.icmp_outbound_map.get(key)
 
         if translated_id is not None:
