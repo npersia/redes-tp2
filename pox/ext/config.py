@@ -9,8 +9,10 @@ ARP_CLEAN_INTERVAL = 3  # Intervalo de limpieza de la tabla ARP en segundos
 # Configuración de Red Base
 PRIVATE_SUBNET = IPAddr("192.168.1.0")
 PRIVATE_MASK = 24
-PRIVATE_IP_ROUTER = IPAddr("192.168.1.254")
-PUBLIC_IP_ROUTER = IPAddr("200.0.0.254")
+PRIVATE_IP_ROUTER = IPAddr("192.168.1.250")
+PRIVATE = "192.168.1.250"
+PUBLIC_IP_ROUTER = IPAddr("200.0.0.250")
+PUBLIC_IP = "200.0.0.250"
 PUBLIC_MAC_ROUTER = EthAddr("00:00:00:aa:aa:aa")
 PRIVATE_MAC_ROUTER = EthAddr("00:00:00:bb:bb:bb")
 PUBLIC_PORT = 1

@@ -11,7 +11,7 @@ from collections import defaultdict
 # [MONITOR ARP/NAT] Import exclusivo del monitor; no afecta el comportamiento del protorouter.
 import threading
 import time
-from ext.config import FLOW_IDLE_TIMEOUT, ARP_TIMEOUT, ARP_CLEAN_INTERVAL, PRIVATE_SUBNET, PRIVATE_MASK, PRIVATE_IP, PUBLIC_IP, PUBLIC_MAC, PRIVATE_MAC, PUBLIC_PORT
+from ext.config import FLOW_IDLE_TIMEOUT, ARP_TIMEOUT, ARP_CLEAN_INTERVAL, PRIVATE_SUBNET, PRIVATE_MASK, PRIVATE_IP_ROUTER as PRIVATE_IP, PUBLIC_IP_ROUTER as PUBLIC_IP, PUBLIC_MAC_ROUTER as PUBLIC_MAC, PRIVATE_MAC_ROUTER as PRIVATE_MAC, PUBLIC_PORT
 # TODO: no cerrar el popup antes del protorouter
 # TODO: agregar un env para variables de configuracion (timeouts)
 log = core.getLogger()

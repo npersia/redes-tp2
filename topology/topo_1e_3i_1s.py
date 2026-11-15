@@ -6,7 +6,12 @@ from mininet.node import RemoteController
 from mininet.cli import CLI
 from mininet.link import TCLink
 from mininet.log import setLogLevel
+import os
+import sys
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from pox.pox.lib.addresses import EthAddr, IPAddr
+from pox.ext.config import PRIVATE, PUBLIC_IP
 
 class NATTopo(Topo):
     def build(self):
@@ -15,15 +20,15 @@ class NATTopo(Topo):
 
         # Host público (Servidor)
         h1 = self.addHost('h1', ip='200.0.0.1/24',
-                          mac='00:00:00:00:00:01', defaultRoute='via 200.0.0.254')
+                          mac='00:00:00:00:00:01', defaultRoute='via {PUBLIC_IP}')
 
         # Hosts privados (Clientes)
         h2 = self.addHost('h2', ip='192.168.1.2/24', mac='00:00:00:00:00:02',
-                          defaultRoute='via 192.168.1.254')
+                          defaultRoute='via {PRIVATE}')
         h3 = self.addHost('h3', ip='192.168.1.3/24', mac='00:00:00:00:00:03',
-                          defaultRoute='via 192.168.1.254')
+                          defaultRoute='via {PRIVATE}')
         h4 = self.addHost('h4', ip='192.168.1.4/24', mac='00:00:00:00:00:04',
-                          defaultRoute='via 192.168.1.254')
+                          defaultRoute='via {PRIVATE}')
 
         # Conexiones: h1 conectará en puerto 1, h2 en puerto 2, h3 en puerto 3, h4 en puerto 4
         self.addLink(h1, s1)
