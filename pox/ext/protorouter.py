@@ -12,7 +12,6 @@ from collections import defaultdict
 import threading
 import time
 from ext.config import FLOW_IDLE_TIMEOUT, ARP_TIMEOUT, ARP_CLEAN_INTERVAL, PRIVATE_SUBNET, PRIVATE_MASK, PRIVATE_IP_ROUTER as PRIVATE_IP, PUBLIC_IP_ROUTER as PUBLIC_IP, PUBLIC_MAC_ROUTER as PUBLIC_MAC, PRIVATE_MAC_ROUTER as PRIVATE_MAC, PUBLIC_PORT
-# TODO: no cerrar el popup antes del protorouter
 # TODO: agregar un env para variables de configuracion (timeouts)
 log = core.getLogger()
 # Estilos para Logs
@@ -248,7 +247,6 @@ class PATManager(object):
 
         key = (src_ip, dst_ip, original_id)
 
-        # TODO: ¿Ya existe una traducción para este tráfico?
         translated_id = self.icmp_outbound_map.get(key)
 
         if translated_id is not None:
