@@ -9,9 +9,9 @@ from mininet.log import setLogLevel
 import os
 import sys
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from pox.pox.lib.addresses import EthAddr, IPAddr
-from pox.ext.config import PRIVATE, PUBLIC_IP
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../pox")))
+from pox.lib.addresses import EthAddr, IPAddr
+from ext.config import PRIVATE, PUBLIC_IP
 
 class NATTopo(Topo):
     def build(self):
