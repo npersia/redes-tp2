@@ -12,7 +12,6 @@ from collections import defaultdict
 import threading
 import time
 from ext.config import FLOW_IDLE_TIMEOUT, ARP_TIMEOUT, ARP_CLEAN_INTERVAL, PRIVATE_SUBNET, PRIVATE_MASK, PRIVATE_IP_ROUTER as PRIVATE_IP, PUBLIC_IP_ROUTER as PUBLIC_IP, PUBLIC_MAC_ROUTER as PUBLIC_MAC, PRIVATE_MAC_ROUTER as PRIVATE_MAC, PUBLIC_PORT
-# TODO: agregar un env para variables de configuracion (timeouts)
 log = core.getLogger()
 # Estilos para Logs
 #
@@ -27,7 +26,7 @@ log = core.getLogger()
 #   MAGENTA -> Ciclo de vida / configuración: inicio del router, tabla ARP,
 #              pool PAT, conexión OpenFlow arriba/abajo y arranque del módulo.
 #   AMARILLO-> Advertencia / evento esperable pero no ideal: entrada ARP
-#              vencida, MAC desconocida (encolar/inundar), request no
+#              vencida, MAC desconocida (encolar/flood), request no
 #              gestionado, liberación de PAT, protocolo/opcode no soportado.
 #   ROJO    -> Error real: puertos PAT agotados, paquete inválido/no parseable.
 RED = "\033[31m"
@@ -117,9 +116,7 @@ class ARPManager(EventMixin):
             log_color(RED, f"[ARP] Paquete ARP inválido o no parseable en puerto {in_port}")
             return None
 
-        # Anti-spoofing: una IP privada solo puede aparecer por un puerto privado
-        # y una IP no privada solo por el puerto público. Si no coincide, no se
-        # aprende ni se procesa (evita que un host público se haga pasar por uno privado).
+        # Una IP privada solo puede aparecer por un puerto privado
         src_is_private = arp_pkt.protosrc.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK)
         if src_is_private == (in_port == PUBLIC_PORT):
             log_color(YELLOW, f"[ARP] Descartado: {arp_pkt.protosrc} ({arp_pkt.hwsrc}) no corresponde al puerto {in_port} (posible spoofing)")
@@ -144,8 +141,8 @@ class ARPManager(EventMixin):
                 log_color(CYAN, f"[ARP] Respondiendo a {arp_pkt.protosrc} por IP Pública {PUBLIC_IP}")
                 self._send_arp_reply(connection, in_port, PUBLIC_MAC, PUBLIC_IP, arp_pkt.hwsrc, arp_pkt.protosrc)
             elif arp_pkt.protodst.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
-                # Consulta entre hosts locales (ej: h3 buscando a h2) -> Inundar solo la LAN privada
-                log_color(CYAN, f"[ARP] Request local por {arp_pkt.protodst}; inundando la LAN privada")
+                # Consulta entre hosts locales (ej: h3 buscando a h2) -> Hacer flood solo en la LAN privada
+                log_color(CYAN, f"[ARP] Request local por {arp_pkt.protodst}; haciendo flood en la LAN privada")
                 self.flood_private(connection, event.ofp, in_port)
             else:
                 log_color(YELLOW, f"[ARP] Request no gestionado para {arp_pkt.protodst}; ignorado")
@@ -165,7 +162,7 @@ class ARPManager(EventMixin):
                     msg.actions.append(of.ofp_action_output(port=reply_entry.port))
                     connection.send(msg)
                 elif arp_pkt.protodst.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
-                    log_color(CYAN, f"[ARP] Destino del Reply {arp_pkt.protodst} desconocido; inundando la LAN privada")
+                    log_color(CYAN, f"[ARP] Destino del Reply {arp_pkt.protodst} desconocido; haciendo flood en la LAN privada")
                     self.flood_private(connection, event.ofp, in_port)
                 else:
                     log_color(YELLOW, f"[ARP] Reply para {arp_pkt.protodst} fuera de la LAN y desconocido; ignorado")
@@ -180,7 +177,7 @@ class ARPManager(EventMixin):
         return None
 
     def flood_private(self, connection, data, in_port):
-        """Inunda un paquete solo por los puertos de la LAN privada.
+        """Realizar el flood de un paquete solo por los puertos de la LAN privada.
 
         A diferencia de OFPP_FLOOD (todos los puertos menos el de entrada), excluye
         el PUBLIC_PORT: un router separa dominios de broadcast, así que nada de la
@@ -191,7 +188,7 @@ class ARPManager(EventMixin):
             if p < of.OFPP_MAX and p != PUBLIC_PORT and p != in_port
         ]
         if not ports:
-            log.debug(f"[FLOOD] Sin puertos privados para inundar (in_port={in_port})")
+            log.debug(f"[FLOOD] Sin puertos privados para realizar flood (in_port={in_port})")
             return
 
         msg = of.ofp_packet_out()
@@ -711,7 +708,7 @@ class ProtoRouter(object):
             dst_port = dst_entry.port if dst_entry else None
 
             if not dst_port:
-                log_color(YELLOW, f"[LAN] MAC desconocida para {dst_ip}; inundando la LAN privada")
+                log_color(YELLOW, f"[LAN] MAC desconocida para {dst_ip}; haciendo flood en la LAN privada")
                 self.arp_mgr.flood_private(self.connection, event.ofp, in_port)
                 return
 
@@ -948,20 +945,4 @@ Consecuencia: el flujo entrante ICMP (protorouter.py:840-847) matchea cualquier 
 
 TODO: Revisar lo siguiente:
 La key PAT es (src_ip, src_port, proto) sin destino (protorouter.py:371): dos conexiones desde el mismo host:puerto hacia destinos distintos comparten puerto público. Defendible (mapeo endpoint-independent, coincide con el Cuadro 1), pero como la liberación depende solo del flujo entrante, si ese destino no responde, el puerto compartido se libera y se reasigna a mitad de la otra conexión.
-
-TODO: Respuestas que llegan al controlador antes de que el switch aplique la regla entrante se descartan.
-Al instalar fm_out/fm_in y hacer el packet_out del primer paquete, la respuesta del host público vuelve en
-microsegundos y OVS todavía puede usar su caché de datapath vieja (la actualiza de forma asíncrona). Si esa
-caché dice "mandar al controlador", la respuesta llega como packet_in con dst = PUBLIC_IP, cae en la rama
-"tráfico para la IP del router" de process_ip y se descarta ("ICMP tipo 0 ... no se responde" o
-"Paquete no ICMP para IP del router ... no se procesa"). Verificado con pruebas en Mininet:
-- ICMP: se pierde el primer ping (33% con -c 3).
-- TCP: se descartó un SYN-ACK; TCP lo recupera retransmitiendo (~1 s de demora).
-- UDP: se perdería el datagrama.
-Distinto del TODO 1: ahí la respuesta va al host equivocado por una regla vieja de otro host; acá no hay
-ninguna regla vieja y la respuesta se pierde en el controlador.
-Solución propuesta: en la rama dst == PUBLIC_IP, antes de descartar, buscar el mapeo:
-- TCP/UDP: inbound_map[(tp_dst, proto)] -> (ip, puerto privados); traducir dst IP/puerto y MACs y hacer
-  packet_out al puerto del host privado.
-- ICMP: buscar en icmp_entries por (IP remota, Echo ID) y reenviar al host que hizo el ping.
 """
