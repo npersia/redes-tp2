@@ -1,6 +1,7 @@
 # redes-tp2 — SDN: NAT con POX y Mininet
 
 El controlador y la topología base vienen del repo de la cátedra: https://github.com/TA048/tp_sdn_nat
+Repositorio oficial de POX: https://github.com/noxrepo/pox
 
 ## Estructura
 
@@ -9,6 +10,7 @@ El controlador y la topología base vienen del repo de la cátedra: https://gith
 | `pox/` | Controlador POX (repo oficial) |
 | `pox/ext/protorouter_template.py` | Nuestro controlador (parte del de la cátedra) |
 | `topology/topo.py` | Topología de Mininet: h1 (pública) — s1 (NAT) — h2 (privada) |
+| `topology/topo_1e_3i_1s.py` | Topología de Mininet utilizada para las pruebas |
 
 ## Topología
 
@@ -19,9 +21,11 @@ El controlador y la topología base vienen del repo de la cátedra: https://gith
 | s1, interfaz pública (puerto 1) | 200.0.0.254 | 00:00:00:aa:aa:aa | — |
 | s1, interfaz privada (puerto 2) | 192.168.1.254 | 00:00:00:bb:bb:bb | — |
 
+* Las IP publica y privada del protorouter son modificables desde `pox/ext/config.py`
+
 ## Instalación
 
-### 1. Python 3.9
+### 1. Python 3.9 - Version con la cual se implementa POX
 
 ```bash
 sudo apt install software-properties-common -y
@@ -53,12 +57,12 @@ Hacen falta dos terminales. Primero se levanta el controlador y después la topo
 cd redes-tp2
 source venv/bin/activate
 cd pox
-python pox.py log.level --DEBUG openflow.of_01 --port=6653 protorouter
+python pox.py log.level --DEBUG openflow.of_01  protorouter
 ```
 
-> **Importante:** `openflow.of_01 --port=6653` es necesario. POX escucha por defecto en el puerto 6633, pero Mininet 2.3 busca al controlador en el 6653. Si los puertos no coinciden, el switch nunca se conecta y se descartan todos los paquetes.
+> **Importante:** `openflow.of_01` es necesario. POX escucha por defecto en el puerto 6633, pero Mininet 2.3 busca al controlador en el 6633. Si los puertos no coinciden, el switch nunca se conecta y se descartan todos los paquetes.
 
-Tiene que quedar en `Listening on 0.0.0.0:6653`.
+Tiene que quedar en `Listening on 0.0.0.0:6633`.
 
 ### Terminal 2: topología de Mininet
 
@@ -67,13 +71,20 @@ cd redes-tp2
 sudo python3 topology/topo.py
 ```
 
+o 
+
+```bash
+cd redes-tp2
+sudo python3 topology/topo_1e_ei_1s.py
+```
+
 Cuando el switch se conecta, en la terminal de POX aparece:
 
 ```
 Iniciando ProtoRouter para Switch 1
 ```
 
-## Pruebas
+## Pruebas basicas usando mininet
 
 Desde la CLI de Mininet (`mininet>`):
 
