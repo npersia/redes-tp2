@@ -1,0 +1,47 @@
+Levantar todo y mostrar que quede todo vacio
+
+h1 arp -n
+mininet> h2 arp -n
+mininet> h3 arp -n
+mininet> h4 arp -n
+
+/* mostrar la tabla y ver que esta vacia*/
+
+limpiar iperf
+sh killall iperf
+
+limpiar caches ARP
+h<<X>> ip neigh flush all
+
+
+py [h.cmd('ip neigh flush all') for h in (h1, h2, h3, h4)]
+
+
+TCP privada-publica
+h1 iperf -s &
+h2 iperf -c 200.0.0.1 -t 10 &
+h3 iperf -c 200.0.0.1 -t 10 &
+h4 iperf -c 200.0.0.1 -t 10
+
+
+py [h.cmd('iperf -c 200.0.0.1 -t 10 &') for h in (h2, h3, h4)]
+
+UDP privada-publica (muestra cantidad de paquetes perdidos)
+h1 iperf -s -u &
+h2 iperf -c 200.0.0.1 -t 10  -u -b 10M &
+h3 iperf -c 200.0.0.1 -t 10 -u -b 10M &
+h4 iperf -c 200.0.0.1 -t 10 -u -b 10M &
+
+
+py [h.cmd('iperf -c 200.0.0.1 -t 10 -u -b 10M &') for h in (h2, h3, h4)]
+
+
+ping basico privada-publico
+
+h2 ping h1
+h3 ping h1
+
+ping basico entre privados
+h3 ping h2
+
+
