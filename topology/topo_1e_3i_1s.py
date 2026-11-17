@@ -20,15 +20,15 @@ class NATTopo(Topo):
 
         # Host público (Servidor)
         h1 = self.addHost('h1', ip='200.0.0.1/24',
-                          mac='00:00:00:00:00:01', defaultRoute='via {PUBLIC_IP}')
+                          mac='00:00:00:00:00:01', defaultRoute=f'via {PUBLIC_IP}')
 
         # Hosts privados (Clientes)
         h2 = self.addHost('h2', ip='192.168.1.2/24', mac='00:00:00:00:00:02',
-                          defaultRoute='via {PRIVATE}')
+                          defaultRoute=f'via {PRIVATE}')
         h3 = self.addHost('h3', ip='192.168.1.3/24', mac='00:00:00:00:00:03',
-                          defaultRoute='via {PRIVATE}')
+                          defaultRoute=f'via {PRIVATE}')
         h4 = self.addHost('h4', ip='192.168.1.4/24', mac='00:00:00:00:00:04',
-                          defaultRoute='via {PRIVATE}')
+                          defaultRoute=f'via {PRIVATE}')
 
         # Conexiones: h1 conectará en puerto 1, h2 en puerto 2, h3 en puerto 3, h4 en puerto 4
         self.addLink(h1, s1)

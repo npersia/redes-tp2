@@ -12,8 +12,6 @@ from collections import defaultdict
 import threading
 import time
 from ext.config import FLOW_IDLE_TIMEOUT, ARP_TIMEOUT, ARP_CLEAN_INTERVAL, PRIVATE_SUBNET, PRIVATE_MASK, PRIVATE_IP_ROUTER as PRIVATE_IP, PUBLIC_IP_ROUTER as PUBLIC_IP, PUBLIC_MAC_ROUTER as PUBLIC_MAC, PRIVATE_MAC_ROUTER as PRIVATE_MAC, PUBLIC_PORT
-# TODO: no cerrar el popup antes del protorouter
-# TODO: agregar un env para variables de configuracion (timeouts)
 log = core.getLogger()
 # Estilos para Logs
 #
@@ -28,7 +26,7 @@ log = core.getLogger()
 #   MAGENTA -> Ciclo de vida / configuración: inicio del router, tabla ARP,
 #              pool PAT, conexión OpenFlow arriba/abajo y arranque del módulo.
 #   AMARILLO-> Advertencia / evento esperable pero no ideal: entrada ARP
-#              vencida, MAC desconocida (encolar/inundar), request no
+#              vencida, MAC desconocida (encolar/flood), request no
 #              gestionado, liberación de PAT, protocolo/opcode no soportado.
 #   ROJO    -> Error real: puertos PAT agotados, paquete inválido/no parseable.
 RED = "\033[31m"
@@ -118,6 +116,12 @@ class ARPManager(EventMixin):
             log_color(RED, f"[ARP] Paquete ARP inválido o no parseable en puerto {in_port}")
             return None
 
+        # Una IP privada solo puede aparecer por un puerto privado
+        src_is_private = arp_pkt.protosrc.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK)
+        if src_is_private == (in_port == PUBLIC_PORT):
+            log_color(YELLOW, f"[ARP] Descartado: {arp_pkt.protosrc} ({arp_pkt.hwsrc}) no corresponde al puerto {in_port} (posible spoofing)")
+            return None
+
         # Aprender dirección MAC y Puerto físico del emisor
         entry = self.arp_table.get(arp_pkt.protosrc)
         if entry is None:
@@ -137,13 +141,9 @@ class ARPManager(EventMixin):
                 log_color(CYAN, f"[ARP] Respondiendo a {arp_pkt.protosrc} por IP Pública {PUBLIC_IP}")
                 self._send_arp_reply(connection, in_port, PUBLIC_MAC, PUBLIC_IP, arp_pkt.hwsrc, arp_pkt.protosrc)
             elif arp_pkt.protodst.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
-                # Consulta entre hosts locales (ej: h3 buscando a h2) -> Inundar a la LAN
-                log_color(CYAN, f"[ARP] Request local por {arp_pkt.protodst}; inundando la LAN")
-                msg = of.ofp_packet_out()
-                msg.data = event.ofp
-                msg.in_port = in_port
-                msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-                connection.send(msg)
+                # Consulta entre hosts locales (ej: h3 buscando a h2) -> Hacer flood solo en la LAN privada
+                log_color(CYAN, f"[ARP] Request local por {arp_pkt.protodst}; haciendo flood en la LAN privada")
+                self.flood_private(connection, event.ofp, in_port)
             else:
                 log_color(YELLOW, f"[ARP] Request no gestionado para {arp_pkt.protodst}; ignorado")
 
@@ -154,14 +154,18 @@ class ARPManager(EventMixin):
             # Reenviar respuesta ARP local si no era para las IPs del router
             if arp_pkt.protodst != PRIVATE_IP and arp_pkt.protodst != PUBLIC_IP:
                 reply_entry = self.arp_table.get(arp_pkt.protodst)
-                dst_port = reply_entry.port if reply_entry else of.OFPP_FLOOD
-                dst_desc = "FLOOD" if dst_port == of.OFPP_FLOOD else f"puerto {dst_port}"
-                log_color(CYAN, f"[ARP] Reenviando Reply a {arp_pkt.protodst} por {dst_desc}")
-                msg = of.ofp_packet_out()
-                msg.data = event.ofp
-                msg.in_port = in_port
-                msg.actions.append(of.ofp_action_output(port=dst_port))
-                connection.send(msg)
+                if reply_entry:
+                    log_color(CYAN, f"[ARP] Reenviando Reply a {arp_pkt.protodst} por puerto {reply_entry.port}")
+                    msg = of.ofp_packet_out()
+                    msg.data = event.ofp
+                    msg.in_port = in_port
+                    msg.actions.append(of.ofp_action_output(port=reply_entry.port))
+                    connection.send(msg)
+                elif arp_pkt.protodst.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
+                    log_color(CYAN, f"[ARP] Destino del Reply {arp_pkt.protodst} desconocido; haciendo flood en la LAN privada")
+                    self.flood_private(connection, event.ofp, in_port)
+                else:
+                    log_color(YELLOW, f"[ARP] Reply para {arp_pkt.protodst} fuera de la LAN y desconocido; ignorado")
 
             if arp_pkt.protosrc in self.pending_packets:
                 pending = self.pending_packets.pop(arp_pkt.protosrc)
@@ -171,6 +175,29 @@ class ARPManager(EventMixin):
             log_color(YELLOW, f"[ARP] Opcode no soportado {arp_pkt.opcode}; ignorado")
 
         return None
+
+    def flood_private(self, connection, data, in_port):
+        """Realizar el flood de un paquete solo por los puertos de la LAN privada.
+
+        A diferencia de OFPP_FLOOD (todos los puertos menos el de entrada), excluye
+        el PUBLIC_PORT: un router separa dominios de broadcast, así que nada de la
+        LAN privada debe salir por la interfaz pública.
+        """
+        ports = [
+            p for p in connection.ports.keys()
+            if p < of.OFPP_MAX and p != PUBLIC_PORT and p != in_port
+        ]
+        if not ports:
+            log.debug(f"[FLOOD] Sin puertos privados para realizar flood (in_port={in_port})")
+            return
+
+        msg = of.ofp_packet_out()
+        msg.data = data
+        msg.in_port = in_port
+        for port in sorted(ports):
+            msg.actions.append(of.ofp_action_output(port=port))
+        connection.send(msg)
+        log.debug(f"[FLOOD] LAN privada por puertos {sorted(ports)} (in_port={in_port})")
 
     def request_mac(self, connection, out_port, src_mac, src_ip, dst_ip):
         """Envía un ARP Request para descubrir una MAC desconocida."""
@@ -218,6 +245,7 @@ class PATManager(object):
         self.inbound_map = {}  # (nat_port, proto) -> (src_ip, src_port)
         # [MONITOR ARP/NAT] Dato adicional para mostrar el destino en la ventana; no afecta el mapeo PAT.
         self.destination_map = {}  # (src_ip, src_port, proto) -> (dst_ip, dst_port)
+        self.active_flows = {}  # (nat_port, proto) -> {("out"|"in", remote_ip, remote_port), ...}
 
 
         # traducciones ICMP
@@ -248,7 +276,6 @@ class PATManager(object):
 
         key = (src_ip, dst_ip, original_id)
 
-        # TODO: ¿Ya existe una traducción para este tráfico?
         translated_id = self.icmp_outbound_map.get(key)
 
         if translated_id is not None:
@@ -360,6 +387,7 @@ class PATManager(object):
             if dst_ip is not None or dst_port is not None:
                 self.destination_map[key] = (dst_ip, dst_port)
             nat_port = self.outbound_map[key]
+            self._track_flows(nat_port, proto, dst_ip, dst_port)
             log_color(CYAN, f"[PAT HIT] {src_ip}:{src_port} (Proto: {proto}) ya mapeado a {PUBLIC_IP}:{nat_port}")
             return nat_port
 
@@ -373,11 +401,36 @@ class PATManager(object):
         # [MONITOR ARP/NAT] Solo guarda el destino para la ventana; no altera el mapeo PAT.
         if dst_ip is not None or dst_port is not None:
             self.destination_map[key] = (dst_ip, dst_port)
+        self._track_flows(nat_port, proto, dst_ip, dst_port)
         log_color(GREEN, f"[PAT MAP] {src_ip}:{src_port} <-> {PUBLIC_IP}:{nat_port} (Proto: {proto}) [libres: {len(self.free_ports)}]")
         return nat_port
 
+    def _track_flows(self, nat_port, proto, dst_ip, dst_port):
+        """Registra los flujos saliente y entrante hacia dst que usan nat_port."""
+        if dst_ip is None or dst_port is None:
+            return
+        flows = self.active_flows.setdefault((nat_port, proto), set())
+        flows.add(("out", dst_ip, dst_port))
+        flows.add(("in", dst_ip, dst_port))
+
+    def flow_expired(self, nat_port, proto, direction, remote_ip, remote_port):
+        """Quita un flujo vencido y libera el puerto si ya no lo usa ningún otro."""
+        key = (nat_port, proto)
+        flows = self.active_flows.get(key)
+        if flows is None:
+            log.debug(f"[PAT] FlowRemoved ignorado: puerto {nat_port} (Proto: {proto}) sin flujos registrados")
+            return
+
+        flows.discard((direction, remote_ip, remote_port))
+        if flows:
+            log.debug(f"[PAT] Venció flujo {direction} {remote_ip}:{remote_port} del puerto {nat_port} (Proto: {proto}); quedan {len(flows)} activo(s)")
+            return
+
+        self.release_port(nat_port, proto)
+
     def release_port(self, nat_port, proto):
         key = (nat_port, proto)
+        self.active_flows.pop(key, None)
         if key in self.inbound_map:
             src_ip, src_port = self.inbound_map.pop(key)
             self.outbound_map.pop((src_ip, src_port, proto), None)
@@ -680,27 +733,28 @@ class ProtoRouter(object):
         if src_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK) and dst_ip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
             dst_entry = self.arp_mgr.arp_table.get(dst_ip)
             dst_port = dst_entry.port if dst_entry else None
+
+            if not dst_port:
+                log_color(YELLOW, f"[LAN] MAC desconocida para {dst_ip}; haciendo flood en la LAN privada")
+                self.arp_mgr.flood_private(self.connection, event.ofp, in_port)
+                return
+
+            log_color(CYAN, f"[LAN] {src_ip} -> {dst_ip} por puerto {dst_port}")
+            # Instalar flujo directo L2/L3 en el switch para conmutación local rápida
+            fm = of.ofp_flow_mod()
+            fm.idle_timeout = FLOW_IDLE_TIMEOUT
+            fm.match.in_port = in_port
+            fm.match.dl_type = 0x0800
+            fm.match.nw_src = src_ip
+            fm.match.nw_dst = dst_ip
+            fm.actions.append(of.ofp_action_output(port=dst_port))
+            self.connection.send(fm)
+            log_color(BLUE, f"[FLOW] LAN instalado: {src_ip} -> {dst_ip} (in={in_port}, out={dst_port}, idle={FLOW_IDLE_TIMEOUT}s)")
+
             msg = of.ofp_packet_out()
             msg.data = event.ofp
             msg.in_port = in_port
-
-            if dst_port:
-                log_color(CYAN, f"[LAN] {src_ip} -> {dst_ip} por puerto {dst_port}")
-                msg.actions.append(of.ofp_action_output(port=dst_port))
-                # Instalar flujo directo L2/L3 en el switch para conmutación local rápida
-                fm = of.ofp_flow_mod()
-                fm.idle_timeout = FLOW_IDLE_TIMEOUT
-                fm.match.in_port = in_port
-                fm.match.dl_type = 0x0800
-                fm.match.nw_src = src_ip
-                fm.match.nw_dst = dst_ip
-                fm.actions.append(of.ofp_action_output(port=dst_port))
-                self.connection.send(fm)
-                log_color(BLUE, f"[FLOW] LAN instalado: {src_ip} -> {dst_ip} (in={in_port}, out={dst_port}, idle={FLOW_IDLE_TIMEOUT}s)")
-            else:
-                log_color(YELLOW, f"[LAN] MAC desconocida para {dst_ip}; inundando la LAN")
-                msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
-
+            msg.actions.append(of.ofp_action_output(port=dst_port))
             self.connection.send(msg)
             return
 
@@ -733,6 +787,9 @@ class ProtoRouter(object):
                 # Flujo Saliente
                 fm_out = of.ofp_flow_mod()
                 fm_out.idle_timeout = FLOW_IDLE_TIMEOUT
+                # El match saliente no incluye el puerto NAT; va en el cookie para saber qué puerto liberar.
+                fm_out.cookie = nat_port
+                fm_out.flags |= of.OFPFF_SEND_FLOW_REM
                 fm_out.match.in_port = in_port
                 fm_out.match.dl_type = 0x0800
                 fm_out.match.nw_proto = proto
@@ -752,6 +809,7 @@ class ProtoRouter(object):
                 # Flujo Entrante
                 fm_in = of.ofp_flow_mod()
                 fm_in.idle_timeout = FLOW_IDLE_TIMEOUT
+                fm_in.cookie = nat_port
                 fm_in.flags |= of.OFPFF_SEND_FLOW_REM
                 fm_in.match.in_port = PUBLIC_PORT
                 fm_in.match.dl_type = 0x0800
@@ -863,37 +921,40 @@ class ProtoRouter(object):
             f"hard_timeout={getattr(ofp, 'hard_timeout', '?')}"
         )
 
-        if match and match.dl_type == 0x0800 and match.nw_dst == PUBLIC_IP:
+        if not match or match.dl_type != 0x0800:
+            log.debug("[FLOW REMOVED] Flujo sin traducción NAT asociada")
+            return
 
-            proto = match.nw_proto
+        proto = match.nw_proto
+        inbound = match.nw_dst == PUBLIC_IP
+        outbound = match.nw_src is not None and match.nw_src.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK)
 
-            # Caso ICMP
-            if proto == ipv4.ICMP_PROTOCOL:
-                cookie = ofp.cookie
-                removed = self.pat_mgr.release_icmp(cookie)
+        # Caso ICMP (solo el flujo entrante pide FlowRemoved)
+        if proto == ipv4.ICMP_PROTOCOL and inbound:
+            cookie = ofp.cookie
+            removed = self.pat_mgr.release_icmp(cookie)
 
-                if removed:
-                    src_ip = removed["src_ip"]
-                    dst_ip = removed["dst_ip"]
+            if removed:
+                src_ip = removed["src_ip"]
+                dst_ip = removed["dst_ip"]
 
-                    log_color(
-                        YELLOW,
-                        f"[NAT ICMP EXPIRE] {src_ip} -> {dst_ip} (cookie={cookie})"
-                    )
-
-            # Caso TCP / UDP
-            else:
-                nat_port = match.tp_dst
-
-                log.debug(
-                    f"[FLOW REMOVED] NAT: {match.nw_src}:"
-                    f"{getattr(match, 'tp_src', '?')} -> "
-                    f"{match.nw_dst}:{getattr(match, 'tp_dst', '?')} "
-                    f"proto={proto}"
+                log_color(
+                    YELLOW,
+                    f"[NAT ICMP EXPIRE] {src_ip} -> {dst_ip} (cookie={cookie})"
                 )
 
-                if nat_port and proto:
-                    self.pat_mgr.release_port(nat_port, proto)
+        # Caso TCP / UDP: el puerto se libera cuando vencen todos sus flujos
+        elif proto in (ipv4.TCP_PROTOCOL, ipv4.UDP_PROTOCOL) and (inbound or outbound):
+            log.debug(
+                f"[FLOW REMOVED] NAT {'entrante' if inbound else 'saliente'}: "
+                f"{match.nw_src}:{match.tp_src} -> {match.nw_dst}:{match.tp_dst} "
+                f"proto={proto} cookie={ofp.cookie}"
+            )
+
+            if inbound and match.tp_dst:
+                self.pat_mgr.flow_expired(match.tp_dst, proto, "in", match.nw_src, match.tp_src)
+            elif outbound and ofp.cookie:
+                self.pat_mgr.flow_expired(ofp.cookie, proto, "out", match.nw_dst, match.tp_dst)
 
         else:
             log.debug("[FLOW REMOVED] Flujo sin traducción NAT asociada")
@@ -906,18 +967,3 @@ def launch():
 
     log_color(MAGENTA, "[ROUTER] Esperando conexiones OpenFlow...")
     core.openflow.addListenerByName("ConnectionUp", start_switch)
-
-
-"""
-TODO: Problemas encontrados
-1. ICMP multi-host: la traducción de Echo-ID nunca se aplica (viola 4.1 y 4.3). Este es el más grave. register_icmp calcula un translated_id (protorouter.py:821) y lo guarda en el cookie, pero:
-- El flujo saliente ICMP solo reescribe MAC e IP origen (protorouter.py:806-809) — nunca el ID del echo.
-- El packet_out del primer paquete manda el paquete original sin modificar (protorouter.py:856-860).
-- OpenFlow 1.0 no tiene acción para reescribir el ID ICMP, y el flujo entrante ICMP tampoco puede matchear por ID.
-Consecuencia: el flujo entrante ICMP (protorouter.py:840-847) matchea cualquier ICMP desde dst_ip hacia PUBLIC_IP sin distinguir host destino. Si h2, h3 y h4 pinguean simultáneamente a h1, los matches son idénticos, cada flow_mod reemplaza al anterior y todas las respuestas se enrutan al último host que instaló el flujo. La Prueba 2.2 del plan (pings simultáneos) falla. Para arreglarlo hay que procesar el ICMP en el controlador (reescritura del ID en el paquete antes del packet_out) en lugar de instalar flujos entrantes ICMP, o al menos no instalar flujo entrante ICMP y resolver cada reply vía tabla.
-
-TODO: Revisar lo siguiente:
-La key PAT es (src_ip, src_port, proto) sin destino (protorouter.py:371): dos conexiones desde el mismo host:puerto hacia destinos distintos comparten puerto público. Defendible (mapeo endpoint-independent, coincide con el Cuadro 1), pero como la liberación depende solo del flujo entrante, si ese destino no responde, el puerto compartido se libera y se reasigna a mitad de la otra conexión.
-TODO: Revisar lo siguiente:
-ARP requests locales se inunden también hacia el puerto público (protorouter.py:160).
-"""

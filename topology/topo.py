@@ -59,7 +59,7 @@ def run():
     s1.cmd("sysctl -w net.ipv6.conf.default.disable_ipv6=1")
     s1.cmd("sysctl -w net.ipv6.conf.lo.disable_ipv6=1")
 
-    # Entradas ARP para debug (TODO: Usar Protocolo ARP)
+    # Entradas ARP para debug 
     net.get('h1').setARP('200.0.0.254', '00:00:00:aa:aa:aa')
     net.get('h2').setARP('192.168.1.254', '00:00:00:bb:bb:bb')
 
